@@ -75,6 +75,7 @@ All actions through one menu: **Ctrl+B, Space**.
 | F2 | Rename active session |
 | Ctrl+R | Claude Code transcript view (browse full conversation history) |
 | Ctrl+D | Delete current worktree |
+| Ctrl+G | Grade the gate — log a trust-ledger event (agreed/override/false alarm/escape) |
 | Ctrl+O | Toggle project drawer |
 | Ctrl+Shift+Left/Right | Switch between projects |
 | Ctrl+E | Edit project settings |
@@ -108,6 +109,7 @@ sw --fast
 **Worktrees:** new worktree, delete worktree
 **Sessions:** new session (split pane), kill pane, rename session, resume dead pane
 **Git:** commit, push, pull, open PR
+**Ledger:** grade the gate — agreed, override, false alarm, escape
 **Other:** switch project, open in terminal, edit settings, help
 
 Sessions with previous conversations resume automatically with `--continue` on relaunch.
@@ -215,6 +217,11 @@ remote = "origin"
 commit_placeholder = "Brief description of changes"
 name_placeholder = "worktree name"
 branch_placeholder = "branch name"
+
+[ledger]
+# Command run to append trust-ledger events (Ctrl+G / fast-mode Ledger menu).
+# Defaults to "ledger.sh" on PATH; set an absolute path if it lives elsewhere.
+cmd = "ledger.sh"
 ```
 
 Global defaults go in `~/.config/sw/config.toml` (same format). Project settings override global.
