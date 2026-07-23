@@ -224,6 +224,8 @@ def config(key: str | None, value: str | None) -> None:
         click.echo(f"  commit_placeholder = {resolved.commit_placeholder}")
         click.echo(f"  name_placeholder   = {resolved.name_placeholder}")
         click.echo(f"  branch_placeholder = {resolved.branch_placeholder}")
+        click.echo("\n[ledger]")
+        click.echo(f"  cmd = {resolved.ledger_cmd}")
         return
 
     if "." not in key:
@@ -326,6 +328,42 @@ def fast_git(action: str, window_ref: str) -> None:
         ok, result = git_create_pr(wt.path, wt.branch)
         print(f"  PR created: {result}" if ok else f"  PR failed: {result}")
 
+    input("  Press Enter to close...")
+
+
+@cli.command("fast-ledger", hidden=True)
+@click.argument("event")
+@click.option("--window", "window_ref", required=True)
+def fast_ledger(event: str, window_ref: str) -> None:
+    """Append a trust-ledger judgment event for fast mode (verdict cockpit, slice d).
+
+    Quick note-less capture: resolves the worktree from --window and shells the
+    ledger CLI in its directory. Mirrors fast-git's window resolution.
+    """
+    from pathlib import Path
+
+    from super_worker.services.fast_ui import resolve_window_ref
+    from super_worker.services.ledger import LEDGER_EVENTS, log_ledger_event
+
+    if event not in LEDGER_EVENTS:
+        click.echo(f"Unknown ledger event '{event}' (expected: {', '.join(LEDGER_EVENTS)}).", err=True)
+        raise SystemExit(1)
+
+    wt_name, ctx_path = resolve_window_ref(window_ref)
+    try:
+        cfg = load_config(Path(ctx_path)) if ctx_path else load_config()
+    except RuntimeError as e:
+        click.echo(str(e), err=True)
+        raise SystemExit(1)
+    state = load_state(cfg)
+    wt = state.get_worktree(wt_name)
+    if not wt:
+        click.echo(f"Worktree '{wt_name}' not found.", err=True)
+        raise SystemExit(1)
+
+    print(f"  Logging ledger '{event}' for {wt.branch}...")
+    ok, msg = log_ledger_event(cfg.ledger_cmd, event, wt.path, wt.branch)
+    print(f"  {msg}" if ok else f"  Ledger failed: {msg}")
     input("  Press Enter to close...")
 
 
@@ -478,8 +516,9 @@ def fast_help() -> None:
   Main menu:  Ctrl+B  then  Space
   \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
   Opens a menu with everything: create/delete
-  worktrees, add sessions, git ops, projects,
-  settings, and more. Just pick from the list.
+  worktrees, add sessions, git ops, ledger
+  (grade the gate: agreed/override/false alarm/
+  escape), projects, settings, and more.
 
   Quick shortcuts (all: Ctrl+B, then key):
     g         Git menu (commit/push/pull/PR)
