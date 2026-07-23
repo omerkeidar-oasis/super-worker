@@ -667,7 +667,9 @@ class ProjectView(Widget):
                 self._config.ledger_cmd, event, wt.path, wt.branch, note, attributed_task,
             )
             if ok:
-                self.app.notify(f"Ledger: logged '{event}' for task '{wt.branch}'")
+                self.app.notify(
+                    f"Ledger: logged '{event}' for {self._config.repo_root.name} · task '{wt.branch}'"
+                )
             else:
                 self.app.notify(f"Ledger failed: {msg[:120]}", severity="error")
 
