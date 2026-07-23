@@ -18,10 +18,12 @@ from super_worker.screens import (
     CommitMessageScreen,
     ConfigScreen,
     ConfirmDeleteScreen,
+    LedgerCaptureScreen,
     NewSessionScreen,
     NewWorktreeScreen,
     RenameSessionScreen,
 )
+from super_worker.services.ledger import log_ledger_event
 from super_worker.services.state import (
     ensure_default_worktree,
     remove_session_from_state,
@@ -633,6 +635,43 @@ class ProjectView(Widget):
             self.app.notify("Settings saved. Some changes take effect on next worktree creation.")
 
         self.app.push_screen(ConfigScreen(self._config), callback=handle_config)
+
+    def do_ledger_capture(self) -> None:
+        """Open the ledger-capture modal for the active worktree (slice d).
+
+        Write-only: appends one judgment event to the worktree's ledger. No
+        watcher, no read-back — feedback is a single toast.
+        """
+        if not self._active_worktree:
+            self.app.notify("Select a worktree first", severity="warning")
+            return
+        wt = self._active_worktree
+
+        def handle_result(result: tuple[str, str | None, str | None] | None) -> None:
+            if result is None:
+                return
+            event, note, attributed_task = result
+            self._log_ledger_event(wt, event, note, attributed_task)
+
+        self.app.push_screen(LedgerCaptureScreen(wt.branch), callback=handle_result)
+
+    def _log_ledger_event(
+        self, wt: Worktree, event: str, note: str | None, attributed_task: str | None,
+    ) -> None:
+        async def _log() -> None:
+            # Fire-and-forget in a worker (like the git actions): the ledger CLI
+            # runs in the worktree's own dir so it targets the right per-repo
+            # ledger, and only a toast reports the outcome.
+            ok, msg = await asyncio.to_thread(
+                log_ledger_event,
+                self._config.ledger_cmd, event, wt.path, wt.branch, note, attributed_task,
+            )
+            if ok:
+                self.app.notify(f"Ledger: logged '{event}' for task '{wt.branch}'")
+            else:
+                self.app.notify(f"Ledger failed: {msg[:120]}", severity="error")
+
+        self.run_worker(_log, exclusive=False)
 
     def do_delete_worktree(self) -> None:
         if not self._active_worktree:

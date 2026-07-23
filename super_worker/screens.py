@@ -11,7 +11,8 @@ from textual.screen import ModalScreen
 from textual.widget import Widget
 from textual.widgets import Button, Checkbox, Input, Label, RadioButton, RadioSet
 
-from super_worker.config import ResolvedConfig, SWConfig, WorktreeConfig, EnvConfig, GitConfig, UIConfig, load_toml
+from super_worker.config import ResolvedConfig, SWConfig, WorktreeConfig, EnvConfig, GitConfig, LedgerConfig, UIConfig, load_toml
+from super_worker.services.ledger import LEDGER_EVENTS, LEDGER_EVENT_LABELS
 
 
 def _dispatch_screen_enter(widget: Widget) -> bool:
@@ -355,6 +356,84 @@ class CommitMessageScreen(_ModalNavMixin, ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class LedgerCaptureScreen(_ModalNavMixin, ModalScreen[tuple[str, str | None, str | None] | None]):
+    """One-keystroke trust-ledger capture (verdict cockpit, slice d).
+
+    Opened by the ledger leader key. Picks one of four judgment events, plus an
+    optional note; the attributed-task field is enabled only for ``escape`` and
+    pre-filled with the active worktree's branch. Dismisses with
+    ``(event, note, attributed_task)`` or ``None`` on cancel.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("enter", "submit", "Log", show=False),
+        *_NAV_BINDINGS,
+    ]
+
+    DEFAULT_CSS = """
+    LedgerCaptureScreen {
+        align: center middle;
+    }
+    #ledger-dialog {
+        width: 64;
+        height: auto;
+        max-height: 90%;
+        border: thick $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    #ledger-event-set {
+        height: auto;
+        margin: 0 0 1 0;
+    }
+    """
+
+    def __init__(self, branch: str) -> None:
+        super().__init__()
+        self._branch = branch
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ledger-dialog"):
+            yield Label("Grade the gate — log a trust event")
+            with ModalRadioSet(id="ledger-event-set"):
+                for i, event in enumerate(LEDGER_EVENTS):
+                    yield ModalRadioButton(
+                        LEDGER_EVENT_LABELS[event], value=(i == 0), id=f"ledger-ev-{event}"
+                    )
+            yield Label("Note (optional):")
+            yield Input(placeholder="why you graded it this way", id="ledger-note")
+            yield Label("Attributed task (escape only):")
+            yield Input(value=self._branch, id="ledger-attributed", disabled=True)
+            yield Label(f"Task: {self._branch}  ·  Enter to log, Escape to cancel")
+
+    def _selected_event(self) -> str:
+        idx = self.query_one("#ledger-event-set", RadioSet).pressed_index
+        if idx < 0 or idx >= len(LEDGER_EVENTS):
+            idx = 0
+        return LEDGER_EVENTS[idx]
+
+    def on_radio_set_changed(self, event: RadioSet.Changed) -> None:
+        is_escape = 0 <= event.index < len(LEDGER_EVENTS) and LEDGER_EVENTS[event.index] == "escape"
+        # Attributed task only applies to escape events (the CLI rejects it
+        # elsewhere) — enable the field so it's clearly the escape-only input.
+        self.query_one("#ledger-attributed", Input).disabled = not is_escape
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.action_submit()
+
+    def action_submit(self) -> None:
+        event = self._selected_event()
+        note = self.query_one("#ledger-note", Input).value.strip() or None
+        attributed = None
+        if event == "escape":
+            attributed = self.query_one("#ledger-attributed", Input).value.strip() or None
+        self.dismiss((event, note, attributed))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class BranchExistsScreen(_ModalNavMixin, ModalScreen[str]):
     """Ask user what to do when branch already exists."""
 
@@ -558,6 +637,10 @@ class ConfigScreen(_ModalNavMixin, ModalScreen[SWConfig | None]):
             yield Label("Branch placeholder:", classes="config-label")
             yield Input(value=cfg.ui.branch_placeholder, placeholder=f"{self._config.branch_prefix}<name>", id="cfg-branch-ph")
 
+            yield Label("[ledger]", classes="config-section")
+            yield Label("Ledger command:", classes="config-label")
+            yield Input(value=cfg.ledger.cmd, placeholder="ledger.sh", id="cfg-ledger-cmd")
+
             with Horizontal(id="config-buttons"):
                 yield Button("Save", variant="primary", id="btn-save")
                 yield Button("Cancel", variant="default", id="btn-cfg-cancel")
@@ -575,6 +658,7 @@ class ConfigScreen(_ModalNavMixin, ModalScreen[SWConfig | None]):
             env=EnvConfig(symlinks=csv("cfg-symlinks"), copies=csv("cfg-copies"), post_create_hook=val("cfg-hook")),
             git=GitConfig(main_branch=val("cfg-main-branch"), remote=val("cfg-remote")),
             ui=UIConfig(commit_placeholder=val("cfg-commit"), name_placeholder=val("cfg-name"), branch_placeholder=val("cfg-branch-ph")),
+            ledger=LedgerConfig(cmd=val("cfg-ledger-cmd")),
         )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
