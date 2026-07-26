@@ -147,6 +147,25 @@ Each session shows a colored dot indicating its state:
 
 State detection uses a Claude Code hook (`sw-hook.sh`) that's automatically installed. In fast mode, pane border titles also update with state icons.
 
+## Gate Verdict Badges
+
+Alongside the session-state dot (which tracks *process* state), each worktree shows **gate verdict badges** tracking *trust* state — how the worktree's task fared against its three verification gates. The two signals are independent: a session can be idle (dim dot) while its craftsmanship gate is red, and "blocked on me" never reads as "gate red".
+
+The badges are read-only projections of the worktree's **trust ledger** (`.kinetic/ledger.jsonl`, or `~/.kinetic/ledgers/<repo>.jsonl` for foreign repos) — Super Worker never recomputes trust, it only displays the latest `verdict` per gate for the current branch. Badges appear only once a ledger carries at least one verdict; a worktree with no ledger looks exactly as before.
+
+**Worktree tab** — a compact colored-letter trigram after the name: `D` deterministic, `B` behavioral, `C` craftsmanship.
+
+**Sidebar** — a **Gates** section with a labeled, glyph-marked line per gate.
+
+| Badge | State | Tab color | Sidebar glyph |
+|---|---|---|---|
+| pass | latest verdict green | green | `✓` (green) |
+| fail | latest verdict red | red | `✗` (red) |
+| none | no verdict yet for this gate | dim | `·` (dim) |
+| running | gate in flight | yellow | `◐` (yellow) — reserved; not shown in v0 (the ledger has no open-gate signal yet) |
+
+Verdicts and hand-backs are appended to the ledger by the gate hooks / `ledger.sh`; use **Ctrl+G** to grade a gate during calibration. Badges update live (within a file-watch tick) whenever the ledger changes.
+
 ## Git Actions
 
 Per-worktree git operations available from the TUI sidebar or fast mode menu:

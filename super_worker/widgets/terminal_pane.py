@@ -171,6 +171,17 @@ class TerminalPane(Widget, can_focus=True):
             self.session_name = session_name
             super().__init__()
 
+    class VerdictChanged(Message):
+        """Posted when a worktree's trust ledger changes (kqueue on the ledger file).
+
+        The verdict-cockpit parallel of StateChanged: carries the ledger path
+        that was written so the handler can re-read that worktree's gate badges.
+        """
+
+        def __init__(self, ledger_path: str) -> None:
+            self.ledger_path = ledger_path
+            super().__init__()
+
 
     active_session: reactive[str | None] = reactive(None)
 
@@ -225,6 +236,10 @@ class TerminalPane(Widget, can_focus=True):
         self._hist: dict[str, _SessionHistory] = {}
         self._watcher = PaneWatcher()
         self._watched_state_sessions: set[str] = set()
+        # Trust-ledger files under kqueue watch (verdict cockpit slice a). Holds
+        # only paths that actually exist (start_watching_path skips absent ones),
+        # so a not-yet-created ledger is retried on the next start_watching_paths.
+        self._watched_ledger_paths: set[str] = set()
         # Single-thread executor guarantees FIFO key delivery.
         # run_worker without exclusive=True spawns concurrent workers that can
         # race each other, causing characters to arrive at tmux out of order.
@@ -300,6 +315,30 @@ class TerminalPane(Widget, can_focus=True):
         """Called by kqueue watcher when a session's state file changes."""
         try:
             self.post_message(self.StateChanged(session_name))
+        except Exception:
+            pass
+
+    def start_watching_paths(self, paths: list[str]) -> None:
+        """Watch trust-ledger files for verdict changes (slice a).
+
+        The ledger sibling of ``start_watching_states``. Adds watches for newly
+        requested paths and drops watches for paths no longer requested. Absent
+        ledgers are not watched (``start_watching_path`` returns False) and are
+        therefore left out of the watched set, so they are retried on the next
+        call once the ledger file is created. Safe to call repeatedly.
+        """
+        requested = {str(p) for p in paths}
+        for path in self._watched_ledger_paths - requested:
+            self._watcher.stop_watching_path(path)
+            self._watched_ledger_paths.discard(path)
+        for path in requested - self._watched_ledger_paths:
+            if self._watcher.start_watching_path(path, self._on_ledger_changed):
+                self._watched_ledger_paths.add(path)
+
+    def _on_ledger_changed(self, ledger_path: str) -> None:
+        """Called by kqueue watcher when a watched ledger file changes."""
+        try:
+            self.post_message(self.VerdictChanged(ledger_path))
         except Exception:
             pass
 

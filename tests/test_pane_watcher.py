@@ -333,6 +333,93 @@ class TestStopWatchingState:
 
 
 # ---------------------------------------------------------------------------
+# 7b. Arbitrary-path watches (verdict cockpit slice a: trust ledger)
+# ---------------------------------------------------------------------------
+
+class TestPathWatch:
+    def test_start_watching_path_does_not_create_file(self, watcher, tmp_path):
+        """Unlike a state file, a ledger is never created — absent stays absent."""
+        led = tmp_path / "ledger.jsonl"
+        assert watcher.start_watching_path(str(led), lambda p: None) is False
+        assert not led.exists()
+
+    def test_start_watching_existing_file_returns_true(self, watcher, tmp_path):
+        led = tmp_path / "ledger.jsonl"
+        led.write_text("")
+        assert watcher.start_watching_path(str(led), lambda p: None) is True
+        with watcher._lock:
+            assert str(led) in watcher._path_watches
+
+    @pytest.mark.asyncio
+    async def test_path_callback_fires_on_write_with_path_arg(self, watcher, tmp_path):
+        """Appending to a watched ledger fires callback(path) via kqueue."""
+        led = tmp_path / "ledger.jsonl"
+        led.write_text("")
+        fired: list[str] = []
+        assert watcher.start_watching_path(str(led), lambda p: fired.append(p)) is True
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _write_to_file, led)
+
+        met = await _wait_for(lambda: bool(fired), timeout=5.0)
+        assert met, "path callback did not fire within 5s of a ledger append"
+        assert fired[0] == str(led)
+
+    @pytest.mark.asyncio
+    async def test_path_and_state_watches_coexist(self, watcher, state_dir, tmp_path, monkeypatch):
+        """A ledger path watch and a session state watch fire independently."""
+        import super_worker.constants as _constants
+        monkeypatch.setattr(_constants, "SESSION_STATES_DIR", state_dir)
+
+        led = tmp_path / "ledger.jsonl"
+        led.write_text("")
+        path_fired: list[str] = []
+        state_fired: list[str] = []
+        watcher.start_watching_path(str(led), lambda p: path_fired.append(p))
+        watcher.start_watching_state("coexist-sess", lambda n: state_fired.append(n))
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _write_to_file, led)
+        await loop.run_in_executor(None, _write_to_file, state_dir / "coexist-sess")
+
+        assert await _wait_for(lambda: bool(path_fired), timeout=5.0)
+        assert await _wait_for(lambda: bool(state_fired), timeout=5.0)
+
+    def test_stop_watching_path_removes_from_dict(self, watcher, tmp_path):
+        led = tmp_path / "ledger.jsonl"
+        led.write_text("")
+        watcher.start_watching_path(str(led), lambda p: None)
+        watcher.stop_watching_path(str(led))
+        with watcher._lock:
+            assert str(led) not in watcher._path_watches
+
+    def test_stop_watching_path_nonexistent_is_noop(self, watcher):
+        watcher.stop_watching_path("/never/watched.jsonl")
+
+    @pytest.mark.asyncio
+    async def test_path_callback_does_not_fire_after_stop(self, watcher, tmp_path):
+        led = tmp_path / "ledger.jsonl"
+        led.write_text("")
+        fired: list[str] = []
+        watcher.start_watching_path(str(led), lambda p: fired.append(p))
+        watcher.stop_watching_path(str(led))
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _write_to_file, led)
+        await asyncio.sleep(0.5)
+        assert fired == []
+
+    def test_cleanup_clears_path_watches(self, watcher, tmp_path):
+        led = tmp_path / "ledger.jsonl"
+        led.write_text("")
+        watcher.start_watching_path(str(led), lambda p: None)
+        watcher.cleanup()
+        with watcher._lock:
+            assert watcher._path_watches == {}
+            assert watcher._fd_to_watch == {}
+
+
+# ---------------------------------------------------------------------------
 # 8. Internal API
 # ---------------------------------------------------------------------------
 

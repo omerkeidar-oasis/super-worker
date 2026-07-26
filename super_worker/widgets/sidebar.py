@@ -7,6 +7,7 @@ from textual.widgets import Button, Label, ListItem, ListView, Static
 from super_worker.constants import get_session_type_tag
 from super_worker.models import Session, Worktree
 from super_worker.services.tmux import SessionState, batch_detect_session_states
+from super_worker.services.verdict import GateVerdicts, sidebar_badges_markup
 from super_worker.services.worktree import get_branch_status, get_worktree_dirty
 
 
@@ -72,6 +73,10 @@ class SessionSidebar(Vertical):
         padding: 0 1;
         color: $text-muted;
     }
+    #gate-badges {
+        height: auto;
+        padding: 0 1;
+    }
     #git-actions {
         height: auto;
         padding: 0 1;
@@ -106,6 +111,11 @@ class SessionSidebar(Vertical):
         yield Static("Sessions", classes="sidebar-section")
         yield Static("", id="sidebar-info")
         yield ListView(id="session-list")
+        # Gate verdict badges (verdict cockpit slice a). Hidden until a ledger
+        # for this worktree carries at least one verdict — a non-onboarded
+        # worktree shows no Gates section at all.
+        yield Static("Gates", id="gates-section", classes="sidebar-section")
+        yield Static("", id="gate-badges")
         yield Static("Git", classes="sidebar-section")
         yield Static("", id="git-status")
         with Vertical(id="git-actions"):
@@ -118,6 +128,34 @@ class SessionSidebar(Vertical):
     def on_mount(self) -> None:
         for btn in self.query("#git-actions Button"):
             btn.can_focus = False
+        # Start with the Gates section collapsed; render_gate_badges reveals it
+        # once verdicts arrive.
+        self.query_one("#gates-section", Static).display = False
+        self.query_one("#gate-badges", Static).display = False
+
+    def render_gate_badges(self, verdicts: "GateVerdicts | None") -> None:
+        """Paint (or hide) the gate verdict badges for the shown worktree.
+
+        Deliberately a standalone method, not folded into ``show_worktree``:
+        that method early-returns when session state is unchanged, which would
+        swallow a verdict-only update. ``None`` or an all-none ``GateVerdicts``
+        hides the whole Gates section (badges never clutter a worktree with no
+        ledger verdicts); otherwise all three gates show, dim for the ones with
+        no verdict yet. [PROPOSED]
+        """
+        try:
+            header = self.query_one("#gates-section", Static)
+            badges = self.query_one("#gate-badges", Static)
+        except Exception:
+            return
+        if verdicts is None or verdicts.is_empty():
+            header.display = False
+            badges.display = False
+            return
+        badges.markup = True
+        badges.update(sidebar_badges_markup(verdicts))
+        header.display = True
+        badges.display = True
 
     @staticmethod
     def _state_dot(state: SessionState) -> str:
