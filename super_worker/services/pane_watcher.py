@@ -35,6 +35,10 @@ class PaneWatcher:
         self._lock = threading.Lock()
         self._fd_to_watch: dict[int, _Watch] = {}
         self._state_watches: dict[str, _Watch] = {}
+        # Arbitrary-path watches (verdict cockpit slice a): the trust ledger is
+        # watched with the same kqueue machinery as state files — a JSONL append
+        # fires KQ_NOTE_WRITE exactly as a state write does. Keyed by path.
+        self._path_watches: dict[str, _Watch] = {}
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="sw-kqueue"
         )
@@ -72,6 +76,40 @@ class PaneWatcher:
             return
         self._unregister(watch)
 
+    def start_watching_path(self, path: str, callback: Callable) -> bool:
+        """Watch an arbitrary file for writes. Calls ``callback(path)`` on change.
+
+        The generalized sibling of ``start_watching_state`` (same fd +
+        ``KQ_NOTE_WRITE`` machinery). Two deliberate differences: the file is
+        keyed by its path, and — unlike a state file — it is **never created**.
+        The trust ledger is written by an external tool; touching it here would
+        both fabricate an empty ledger and defeat existence-based path
+        resolution. An absent file is a no-op returning ``False`` so the caller
+        can retry on its next sweep once the ledger appears; ``True`` means a
+        watch was registered.
+        """
+        key = str(path)
+        if key in self._path_watches:
+            self.stop_watching_path(key)
+        try:
+            fd = os.open(key, os.O_RDONLY)
+        except OSError:
+            return False  # absent/unreadable — not watched; caller retries later
+
+        watch = _Watch(fd=fd, callback=callback, callback_arg=key)
+        self._register(watch)
+        with self._lock:
+            self._path_watches[key] = watch
+        return True
+
+    def stop_watching_path(self, path: str) -> None:
+        """Stop watching an arbitrary file."""
+        with self._lock:
+            watch = self._path_watches.pop(str(path), None)
+        if watch is None:
+            return
+        self._unregister(watch)
+
     def cleanup(self) -> None:
         """Stop all watches and shut down."""
         self._running = False
@@ -80,6 +118,8 @@ class PaneWatcher:
             self._task = None
         for name in list(self._state_watches):
             self.stop_watching_state(name)
+        for path in list(self._path_watches):
+            self.stop_watching_path(path)
         try:
             self._kq.close()
         except Exception:

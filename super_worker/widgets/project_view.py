@@ -22,6 +22,12 @@ from super_worker.screens import (
     NewWorktreeScreen,
     RenameSessionScreen,
 )
+from super_worker.services.verdict import (
+    GateVerdicts,
+    ledger_path_for_worktree,
+    read_verdicts,
+    tab_badge_markup,
+)
 from super_worker.services.state import (
     ensure_default_worktree,
     remove_session_from_state,
@@ -164,6 +170,11 @@ class ProjectView(Widget):
         self._active_worktree: Worktree | None = None
         self._active_session_name: str | None = None
         self._cached_session_states: dict[str, SessionState] = {}
+        # Verdict cockpit (slice a): latest gate verdicts per worktree name, and
+        # each worktree's resolved ledger path (for reverse-lookup from a kqueue
+        # VerdictChanged event). Both are refreshed off the event loop.
+        self._worktree_verdicts: dict[str, GateVerdicts] = {}
+        self._ledger_paths: dict[str, str] = {}
         # Only ensure the "main" worktree EXISTS in state (cheap, needed before
         # compose builds the tabs). Its tmux session is created lazily and
         # off the event loop by WorktreeTabContent.on_mount — creating it here
@@ -199,17 +210,21 @@ class ProjectView(Widget):
                 await self._refresh_sidebar(wt)
                 self._set_active_worktree(wt)
                 self._start_state_watching()
+                await self._refresh_verdicts()
 
             self.run_worker(_initial_refresh, exclusive=False)
 
     def _tab_label(self, wt: Worktree, git_data: tuple[dict, bool] | None = None) -> str:
         wt_states = {s.tmux_session_name: self._cached_session_states.get(s.tmux_session_name, SessionState.RUNNING) for s in wt.sessions}
         attention = " 🔔" if has_waiting_approval(wt_states) else ""
+        # Gate badges precede the 🔔: verdict state (gate red) and attention
+        # (blocked on me) are orthogonal signals and read as distinct marks.
+        badge = tab_badge_markup(self._worktree_verdicts.get(wt.name))
         if git_data is None:
-            return f"{wt.name}{attention}"
+            return f"{wt.name}{badge}{attention}"
         status, dirty = git_data
         dirty_marker = " *" if dirty else ""
-        return f"{wt.name} (↑{status['ahead']} ↓{status['behind']}){dirty_marker}{attention}"
+        return f"{wt.name} (↑{status['ahead']} ↓{status['behind']}){dirty_marker}{badge}{attention}"
 
     def _update_app_subtitle(self, session_label: str | None = None) -> None:
         """Update the app subtitle to include the active session label."""
@@ -239,6 +254,100 @@ class ProjectView(Widget):
         except Exception:
             pass
 
+    def _start_ledger_watching(self) -> None:
+        """Start kqueue watches on every worktree's trust ledger (slice a).
+
+        Mirrors ``_start_state_watching``: the active worktree's TerminalPane
+        hosts the ledger watches for the whole project, so a verdict written in
+        any worktree repaints its badge instantly. Only ledgers that currently
+        exist are watched; the periodic sweep re-arms watches for ledgers that
+        appear later (a freshly created worktree has no ledger until its first
+        gate runs).
+        """
+        if not self._active_worktree:
+            return
+        paths = [p for p in self._ledger_paths.values() if p]
+        try:
+            wtc = self.query_one(f"#wtc-{self._active_worktree.name}", WorktreeTabContent)
+            wtc.query_one(TerminalPane).start_watching_paths(paths)
+        except Exception:
+            pass
+
+    async def _reload_verdicts(self) -> bool:
+        """Resolve + read every worktree's ledger into the caches and re-arm
+        watches. Off the event loop; no UI repaint (callers own that so tab
+        labels keep their git ↑↓ info). Returns True if any verdict changed."""
+        changed = False
+        for wt in self._state.worktrees:
+            path = str(await asyncio.to_thread(ledger_path_for_worktree, wt.path))
+            self._ledger_paths[wt.name] = path
+            verdicts = await asyncio.to_thread(read_verdicts, path, wt.branch)
+            if self._worktree_verdicts.get(wt.name) != verdicts:
+                self._worktree_verdicts[wt.name] = verdicts
+                changed = True
+        # Prune verdict/path caches for worktrees that no longer exist.
+        live = {wt.name for wt in self._state.worktrees}
+        for stale in [n for n in self._worktree_verdicts if n not in live]:
+            del self._worktree_verdicts[stale]
+            self._ledger_paths.pop(stale, None)
+            changed = True
+        self._start_ledger_watching()
+        return changed
+
+    async def _refresh_verdicts(self) -> None:
+        """Reload verdicts and repaint badges. Used by mount / re-activation /
+        the kqueue path — none of which carry git data, so tab labels here omit
+        ↑↓ until the next periodic refresh restores it (same as the existing
+        state-change repaint). Crash-proof: a bad ledger never breaks refresh."""
+        try:
+            if await self._reload_verdicts():
+                for wt in self._state.worktrees:
+                    self._refresh_tab_label(wt, git_data=None)
+                self._render_active_gates()
+        except Exception:
+            logger.debug("refresh_verdicts failed", exc_info=True)
+
+    def _render_active_gates(self) -> None:
+        """Paint the active worktree's verdicts into its sidebar Gates section."""
+        wt = self._active_worktree
+        if not wt:
+            return
+        try:
+            wtc = self.query_one(f"#wtc-{wt.name}", WorktreeTabContent)
+            wtc.query_one(SessionSidebar).render_gate_badges(self._worktree_verdicts.get(wt.name))
+        except Exception:
+            pass
+
+    def on_terminal_pane_verdict_changed(self, event: TerminalPane.VerdictChanged) -> None:
+        """A worktree's ledger was written (kqueue) — re-read just that ledger.
+
+        Orthogonal to state/attention: verdict badges repaint, the session dot
+        and the 🔔 are untouched.
+        """
+        path = event.ledger_path
+        names = [n for n, p in self._ledger_paths.items() if p == path]
+        if not names:
+            return
+
+        async def _reread() -> None:
+            changed = False
+            for name in names:
+                wt = self._state.get_worktree(name)
+                if not wt:
+                    continue
+                verdicts = await asyncio.to_thread(read_verdicts, path, wt.branch)
+                if self._worktree_verdicts.get(name) != verdicts:
+                    self._worktree_verdicts[name] = verdicts
+                    changed = True
+            if changed:
+                for name in names:
+                    wt = self._state.get_worktree(name)
+                    if wt:
+                        self._refresh_tab_label(wt, git_data=None)
+                self._render_active_gates()
+
+        self.run_worker(_reread, exclusive=False)
+
     def pause_watching(self) -> None:
         """Pause terminal capture when this project becomes inactive.
 
@@ -262,6 +371,10 @@ class ProjectView(Widget):
             wtc.query_one(TerminalPane).resume_watching()
         except Exception:
             pass
+        # A backgrounded project's periodic verdict refresh is skipped (only the
+        # active project runs periodic_refresh), so re-read on re-activation to
+        # pick up any ledgers that appeared while it was hidden.
+        self.run_worker(self._refresh_verdicts, exclusive=False)
 
     def focus_terminal(self) -> None:
         """Focus the active worktree's terminal pane.
@@ -303,10 +416,15 @@ class ProjectView(Widget):
         def _do_activate() -> None:
             try:
                 wtc = self.query_one(f"#wtc-{wt_name}", WorktreeTabContent)
-                wtc.query_one(SessionSidebar).select_session(tmux_session_name)
+                sidebar = wtc.query_one(SessionSidebar)
+                sidebar.select_session(tmux_session_name)
+                # Paint the now-shown worktree's gate badges from cache and move
+                # the ledger watches onto this (now active) pane.
+                sidebar.render_gate_badges(self._worktree_verdicts.get(wt_name))
                 terminal = wtc.query_one(TerminalPane)
                 terminal.active_session = tmux_session_name
                 terminal.resume_watching()
+                terminal.start_watching_paths([p for p in self._ledger_paths.values() if p])
                 terminal.focus()
             except Exception:
                 pass
@@ -803,8 +921,15 @@ class ProjectView(Widget):
             except Exception:
                 logger.debug("Failed to refresh active worktree sidebar", exc_info=True)
 
+        # Re-resolve/read ledgers before repainting tab labels so badges and the
+        # git ↑↓ paint together. This also catches verdicts written to a ledger
+        # that didn't exist at watch-start (kqueue can't watch a missing file)
+        # and re-arms watches for ledgers that appeared since the last sweep.
+        await self._reload_verdicts()
+
         for wt in self._state.worktrees:
             self._refresh_tab_label(wt, git_data=git_data.get(wt.name))
+        self._render_active_gates()
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
