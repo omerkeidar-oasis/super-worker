@@ -55,7 +55,9 @@ The verdict layer is a **parallel copy of this exact path**: a ledger/results re
 - **Hooks:** `terminal_pane.py:TerminalPane` — when `active_session`'s worktree is flagged, `watch_active_session` renders a verdict overlay before the live pane; a free key toggles to the diff (**not** Ctrl+R — reserved for CC's transcript per `constants.py` RESERVED_KEYS). Triggered from `project_view.py:_set_active_worktree`/`on_session_selected`; diff via a new `worktree.py` git-diff helper beside `get_worktree_dirty`.
 - **Verify:** activate a red worktree → findings show first; the diff key reveals `git diff`; a green worktree drops straight to the live pane.
 
-### (d) Ledger capture keystrokes — *standalone-shippable*
+### (d) Ledger capture keystrokes — **SUPERSEDED (2026-07-27 review decision)**
+
+> Grading moved out of the cockpit entirely: it is **state-driven in the gate flow** — kinetic's `pre-pr` reads the project's trust state and asks the operator for the grade while calibrating (and only on sampled audits after graduation). Rationale: capture's heavy use is transitional (calibration), and sw should carry no feature whose main life is a transition phase; sw stays **display-only** (badges, queue, preview, escalation, rollup). The implementation branch (`program/w3-ledger-capture`, sw PR #2) is parked, not merged. The original slice design is kept below for the record.
 
 - **Does:** one keypress logs exactly one of `agreed | override | false_alarm | escape` by running `scripts/ledger.sh log <event> --task <branch>` with `cwd = worktree.path`, so grading the gate during calibration costs nothing (B5).
 - **Data:** **writes** ledger judgment events (§7 enum). No read path, no watcher — this is why it ships alone and first.
