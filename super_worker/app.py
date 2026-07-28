@@ -59,6 +59,8 @@ class SuperWorkerApp(App):
         # terminal scrollback).
         Binding("f2", "rename_session", "Rename Session"),
         Binding("ctrl+d", "delete_worktree", "Delete Worktree"),
+        # Ledger-capture leader key: "grade the gate" during calibration.
+        Binding("ctrl+g", "ledger_capture", "Grade Gate"),
         Binding("ctrl+o", "toggle_project_drawer", "Projects"),
         Binding("ctrl+shift+left", "prev_project", "Prev Project", key_display="ctrl+⇧◀"),
         Binding("ctrl+shift+right", "next_project", "Next Project", key_display="ctrl+⇧▶"),
@@ -354,6 +356,12 @@ class SuperWorkerApp(App):
     def action_edit_settings(self) -> None:
         if pv := self._active_project_view:
             pv.do_edit_settings()
+        else:
+            self.notify("Open a project first (Ctrl+O)", severity="warning")
+
+    def action_ledger_capture(self) -> None:
+        if pv := self._active_project_view:
+            pv.do_ledger_capture()
         else:
             self.notify("Open a project first (Ctrl+O)", severity="warning")
 

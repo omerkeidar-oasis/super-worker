@@ -214,6 +214,12 @@ def _configure_host_session(session: libtmux.Session, config: ResolvedConfig) ->
         "Git: Pull",          "3", f'display-popup -w 60 -h 6 -E "{sw} fast-git pull --window {wid}"',
         "Git: Open PR",       "4", f'display-popup -w 60 -h 6 -E "{sw} fast-git pr --window {wid}"',
         "",                   "",  "",
+        # -- Ledger (grade the gate during calibration) --
+        "Ledger: agreed",      "5", f'display-popup -w 60 -h 6 -E "{sw} fast-ledger agreed --window {wid}"',
+        "Ledger: override",    "6", f'display-popup -w 60 -h 6 -E "{sw} fast-ledger override --window {wid}"',
+        "Ledger: false alarm", "7", f'display-popup -w 60 -h 6 -E "{sw} fast-ledger false_alarm --window {wid}"',
+        "Ledger: escape",      "8", f'display-popup -w 60 -h 6 -E "{sw} fast-ledger escape --window {wid}"',
+        "",                   "",  "",
         # -- Projects & settings --
         "Switch project",     "p", f'display-popup -w 60 -h 18 -E "{sw} fast-wizard switch-project"',
         "Open in terminal",   "t", f'run-shell "{sw} fast-open-terminal --session {sid}"',

@@ -22,7 +22,9 @@ DEFAULT_WORKTREE_NAME = "main"
 # NOT reserved: Shift+Tab (Claude Code permission-mode cycling) and Ctrl+R
 # (Claude Code's transcript view — the only way to browse a CC session's
 # full history, since CC never writes terminal scrollback). Rename is F2.
-RESERVED_KEYS = {"ctrl+n", "ctrl+s", "ctrl+a", "ctrl+t", "f2", "ctrl+d", "ctrl+e", "ctrl+q", "ctrl+o", "ctrl+shift+left", "ctrl+shift+right", "f12", "tab"}
+# Ctrl+G ("grade the gate") is the ledger-capture leader key — a bare letter
+# would be forwarded to the pane, so the leader must be reserved (design d).
+RESERVED_KEYS = {"ctrl+n", "ctrl+s", "ctrl+a", "ctrl+t", "f2", "ctrl+d", "ctrl+e", "ctrl+q", "ctrl+o", "ctrl+g", "ctrl+shift+left", "ctrl+shift+right", "f12", "tab"}
 
 _WORKTREE_NAME_RE = re.compile(r"[a-zA-Z0-9_-]+")
 

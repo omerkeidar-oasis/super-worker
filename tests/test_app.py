@@ -18,6 +18,7 @@ from super_worker.screens import (
     CommitMessageScreen,
     ConfigScreen,
     ConfirmDeleteScreen,
+    LedgerCaptureScreen,
     NewSessionScreen,
     NewWorktreeScreen,
     RenameSessionScreen,
@@ -286,6 +287,108 @@ async def test_settings_modal_opens():
         await pilot.press("ctrl+e")
         await pilot.pause()
         assert isinstance(app.screen, ConfigScreen)
+
+
+@pytest.mark.asyncio
+async def test_ledger_capture_modal_opens_and_cancels():
+    """Ctrl+G (the ledger leader key) opens LedgerCaptureScreen; Escape dismisses it."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        pv = _pv(app)
+        pv._active_worktree = pv._state.worktrees[0]
+
+        await pilot.press("ctrl+g")
+        await pilot.pause()
+        assert isinstance(app.screen, LedgerCaptureScreen)
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, LedgerCaptureScreen)
+
+
+@pytest.mark.asyncio
+async def test_ledger_capture_submit_invokes_cli(monkeypatch):
+    """Submitting the modal shells the ledger CLI in the worktree dir with its branch.
+
+    Default event is 'agreed', so Ctrl+G then Enter is the whole calibration
+    grade — the write-only path with no watcher (slice d).
+    """
+    import super_worker.widgets.project_view as pvmod
+
+    captured: dict = {}
+
+    def fake_log(ledger_cmd, event, repo_dir, task, note=None, attributed_task=None):
+        captured.update(
+            ledger_cmd=ledger_cmd, event=event, repo_dir=repo_dir,
+            task=task, note=note, attributed_task=attributed_task,
+        )
+        return True, "ledger: logged"
+
+    monkeypatch.setattr(pvmod, "log_ledger_event", fake_log)
+
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        pv = _pv(app)
+        wt = Worktree(name="feat", path="/tmp/wt-feat", branch="sw-feat")
+        pv._active_worktree = wt
+
+        await pilot.press("ctrl+g")
+        await pilot.pause()
+        assert isinstance(app.screen, LedgerCaptureScreen)
+
+        await pilot.press("enter")
+        await pilot.pause(delay=1.0)
+
+        assert captured["event"] == "agreed"
+        assert captured["repo_dir"] == "/tmp/wt-feat"
+        assert captured["task"] == "sw-feat"
+        assert captured["ledger_cmd"] == pv._config.ledger_cmd
+        assert captured["attributed_task"] is None  # non-escape carries no attribution
+
+
+@pytest.mark.asyncio
+async def test_ledger_capture_escape_attributes_to_branch(monkeypatch):
+    """Selecting 'escape' passes an attributed task, defaulting to the worktree branch."""
+    from textual.widgets import RadioButton
+
+    import super_worker.widgets.project_view as pvmod
+
+    captured: dict = {}
+
+    def fake_log(ledger_cmd, event, repo_dir, task, note=None, attributed_task=None):
+        captured.update(event=event, attributed_task=attributed_task)
+        return True, "ledger: logged"
+
+    monkeypatch.setattr(pvmod, "log_ledger_event", fake_log)
+
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        pv = _pv(app)
+        wt = Worktree(name="feat", path="/tmp/wt-feat", branch="sw-feat")
+        pv._active_worktree = wt
+
+        await pilot.press("ctrl+g")
+        await pilot.pause()
+        app.screen.query_one("#ledger-ev-escape", RadioButton).value = True
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause(delay=1.0)
+
+        assert captured["event"] == "escape"
+        assert captured["attributed_task"] == "sw-feat"
+
+
+@pytest.mark.asyncio
+async def test_ledger_capture_no_worktree_warns(monkeypatch):
+    """Ctrl+G with no active worktree warns instead of opening the modal."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        pv = _pv(app)
+        pv._active_worktree = None
+
+        await pilot.press("ctrl+g")
+        await pilot.pause()
+        assert not isinstance(app.screen, LedgerCaptureScreen)
 
 
 @pytest.mark.asyncio

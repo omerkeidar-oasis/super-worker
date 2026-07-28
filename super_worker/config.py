@@ -38,11 +38,19 @@ class UIConfig(BaseModel):
     branch_placeholder: str = ""
 
 
+class LedgerConfig(BaseModel):
+    # Command used to append trust-ledger events (verdict cockpit, slice d).
+    # Empty → resolved to the "ledger.sh" default. May carry args, e.g.
+    # "bash /path/to/scripts/ledger.sh"; it is shell-split at invoke time.
+    cmd: str = ""
+
+
 class SWConfig(BaseModel):
     worktree: WorktreeConfig = WorktreeConfig()
     env: EnvConfig = EnvConfig()
     git: GitConfig = GitConfig()
     ui: UIConfig = UIConfig()
+    ledger: LedgerConfig = LedgerConfig()
 
 
 class ResolvedConfig(BaseModel):
@@ -60,6 +68,9 @@ class ResolvedConfig(BaseModel):
     commit_placeholder: str
     name_placeholder: str
     branch_placeholder: str
+    # Command that appends trust-ledger events (slice d). Defaulted so existing
+    # ResolvedConfig constructions (tests, fixtures) need not pass it.
+    ledger_cmd: str = "ledger.sh"
 
     @property
     def state_hash(self) -> str:
@@ -126,7 +137,7 @@ def save_project_config(repo_root: Path, config: SWConfig) -> Path:
     """Save project-level .sw.toml. Returns the path written."""
     path = repo_root / ".sw.toml"
     lines: list[str] = []
-    for section_name in ("worktree", "env", "git", "ui"):
+    for section_name in ("worktree", "env", "git", "ui", "ledger"):
         section = getattr(config, section_name)
         section_lines: list[str] = []
         for field_name, field_info in type(section).model_fields.items():
@@ -175,7 +186,7 @@ def load_toml(path: Path) -> SWConfig:
 def _merge_configs(project: SWConfig, global_: SWConfig) -> SWConfig:
     """Merge project over global. Non-empty project values win."""
     merged = SWConfig()
-    for section in ("worktree", "env", "git", "ui"):
+    for section in ("worktree", "env", "git", "ui", "ledger"):
         proj_section = getattr(project, section)
         glob_section = getattr(global_, section)
         merged_section = getattr(merged, section)
@@ -232,4 +243,5 @@ def load_config(repo_path: Path | str | None = None) -> ResolvedConfig:
         commit_placeholder=merged.ui.commit_placeholder or "Brief description of changes",
         name_placeholder=merged.ui.name_placeholder or "feature-name",
         branch_placeholder=merged.ui.branch_placeholder or f"{branch_prefix}<name>",
+        ledger_cmd=merged.ledger.cmd or "ledger.sh",
     )
