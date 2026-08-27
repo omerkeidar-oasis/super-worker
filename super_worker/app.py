@@ -15,6 +15,12 @@ from super_worker.services.state import (
     load_projects_registry,
     remove_from_projects_registry,
 )
+from super_worker.services.ui_state import (
+    ProjectUIState,
+    UIState,
+    load_ui_state,
+    save_ui_state,
+)
 from super_worker.widgets.project_drawer import (
     DockToggled,
     ProjectDrawer,
@@ -23,6 +29,7 @@ from super_worker.widgets.project_drawer import (
     ProjectTabBar,
 )
 from super_worker.widgets.project_view import ProjectView
+from super_worker.widgets.sidebar import SidebarDivider
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +83,16 @@ class SuperWorkerApp(App):
         self._initial_project: tuple[ResolvedConfig, object] | None = None
         self._attention_paths: set[str] = set()
 
+        # Workspace UI-state (open projects, per-project active worktree/session,
+        # sidebar width) persisted from the last run. Saves are gated on this flag
+        # so a mid-restore write can't persist a half-open project list.
+        self._ui_state: UIState = load_ui_state()
+        self._workspace_ready = False
+        # Seed the sidebar width BEFORE composing so freshly-mounted dividers
+        # (which read this class attribute on mount) adopt the restored width.
+        if self._ui_state.sidebar_width is not None:
+            SidebarDivider._shared_width = self._ui_state.sidebar_width
+
         try:
             config = load_config()
             state = load_and_reconcile(config)
@@ -106,7 +123,13 @@ class SuperWorkerApp(App):
                 )
                 if self._initial_project:
                     config, state = self._initial_project
-                    yield ProjectView(config, state, id=f"pv-{config.state_hash}")
+                    saved = self._ui_state.projects.get(str(config.repo_root))
+                    yield ProjectView(
+                        config, state,
+                        restore_worktree=saved.worktree if saved else None,
+                        restore_session=saved.session if saved else None,
+                        id=f"pv-{config.state_hash}",
+                    )
         yield Footer()
 
     def on_mount(self) -> None:
@@ -118,13 +141,69 @@ class SuperWorkerApp(App):
                 self.sub_title = str(config.repo_root)
             except Exception:
                 pass
-        else:
-            # Auto-open drawer so user can pick a project
-            self.call_after_refresh(lambda: self.query_one(ProjectDrawer).open())
 
         self._refresh_drawer()
         self.query_one(ProjectTabBar).show()
         self.set_interval(SIDEBAR_REFRESH_S, self._periodic_refresh)
+        # Reopen the projects that were open last run (skips the launch project,
+        # already mounted, and any paths that no longer exist). Runs once, in a
+        # worker so heavy project loads stay off the mount path.
+        self.run_worker(self._restore_workspace, exclusive=False)
+
+    async def _restore_workspace(self) -> None:
+        """Reopen previously-open projects, then unlock workspace persistence."""
+        initial_path = (
+            str(self._initial_project[0].repo_root) if self._initial_project else None
+        )
+        reopened_any = False
+        for path in self._ui_state.open_projects:
+            if path == initial_path or not Path(path).exists():
+                continue
+            try:
+                await self._open_or_switch_project(path)
+                reopened_any = True
+            except Exception:
+                logger.debug("Failed to restore project %s", path, exc_info=True)
+        # Keep the launch (CWD) project focused if there was one; otherwise, when
+        # nothing was restored, prompt the user to pick a project.
+        if self._initial_project and reopened_any:
+            await self._activate_project(self._initial_project[0])
+        elif not self._initial_project and not self._open_configs:
+            try:
+                self.query_one(ProjectDrawer).open()
+            except Exception:
+                pass
+        self._workspace_ready = True
+        self.save_workspace_state()
+
+    def save_workspace_state(self) -> None:
+        """Persist open projects, per-project active worktree/session, sidebar width.
+
+        Called on discrete user actions (project open/close, worktree/session
+        switch, divider drag end) — never on a hot path. Gated on
+        ``_workspace_ready`` so a mid-restore write can't truncate open_projects.
+        """
+        if not self._workspace_ready:
+            return
+        try:
+            projects: dict[str, ProjectUIState] = {}
+            for cfg in self._open_configs:
+                try:
+                    pv = self.query_one(f"#pv-{cfg.state_hash}", ProjectView)
+                except Exception:
+                    continue
+                projects[str(cfg.repo_root)] = ProjectUIState(
+                    worktree=pv.active_worktree_name,
+                    session=pv.active_session_name,
+                )
+            state = UIState(
+                open_projects=[str(cfg.repo_root) for cfg in self._open_configs],
+                projects=projects,
+                sidebar_width=SidebarDivider._shared_width,
+            )
+            save_ui_state(state)
+        except Exception:
+            logger.debug("Failed to persist workspace UI-state", exc_info=True)
 
     # ── Periodic refresh ──────────────────────────────────────────────────────
 
@@ -257,6 +336,7 @@ class SuperWorkerApp(App):
                 except Exception:
                     logger.debug("Failed to show no-project placeholder", exc_info=True)
         self._refresh_drawer()
+        self.save_workspace_state()
         self.notify(f"Removed: {Path(event.path).name}")
 
     async def _open_or_switch_project(self, path: str) -> None:
@@ -287,7 +367,13 @@ class SuperWorkerApp(App):
         new_state = await asyncio.to_thread(load_and_reconcile, new_config)
 
         pv_id = f"pv-{new_config.state_hash}"
-        pv = ProjectView(new_config, new_state, id=pv_id)
+        saved = self._ui_state.projects.get(str(new_config.repo_root))
+        pv = ProjectView(
+            new_config, new_state,
+            restore_worktree=saved.worktree if saved else None,
+            restore_session=saved.session if saved else None,
+            id=pv_id,
+        )
 
         switcher = self.query_one("#project-switcher", ContentSwitcher)
 
@@ -301,6 +387,7 @@ class SuperWorkerApp(App):
         self._open_configs.append(new_config)
         self.sub_title = str(new_config.repo_root)
         self._refresh_drawer()
+        self.save_workspace_state()
         self.notify(f"Opened: {new_config.repo_root.name}")
 
     async def _activate_project(self, config: ResolvedConfig) -> None:

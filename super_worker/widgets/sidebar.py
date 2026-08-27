@@ -237,9 +237,9 @@ class SidebarDivider(Static):
     """Thin vertical bar between the session sidebar and the terminal pane.
 
     Drag it left/right to resize the sidebar. The chosen width is a class-level
-    value so every worktree tab (across all projects) stays in sync for the rest
-    of the session. Nothing is persisted to disk — reopening the app restores the
-    default width.
+    value so every worktree tab (across all projects) stays in sync. The width is
+    also persisted to the workspace UI-state on drag end and re-applied on the
+    next launch (the app seeds ``_shared_width`` from disk before composing).
     """
 
     DEFAULT_CSS = """
@@ -316,6 +316,14 @@ class SidebarDivider(Static):
             try:
                 for sidebar in self.app.query(SessionSidebar):
                     sidebar.styles.width = width
+            except Exception:
+                pass
+        # Persist the chosen width so the next launch restores it. Drag end is a
+        # discrete user action (not a hot path), so a tiny synchronous write is fine.
+        save = getattr(self.app, "save_workspace_state", None)
+        if save is not None:
+            try:
+                save()
             except Exception:
                 pass
         event.stop()

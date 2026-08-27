@@ -164,13 +164,24 @@ class ProjectView(Widget):
     }
     """
 
-    def __init__(self, config: ResolvedConfig, state: AppState, **kwargs) -> None:
+    def __init__(
+        self,
+        config: ResolvedConfig,
+        state: AppState,
+        restore_worktree: str | None = None,
+        restore_session: str | None = None,
+        **kwargs,
+    ) -> None:
         super().__init__(**kwargs)
         self._config = config
         self._state = state
         self._active_worktree: Worktree | None = None
         self._active_session_name: str | None = None
         self._cached_session_states: dict[str, SessionState] = {}
+        # One-shot workspace-restore hints: the worktree tab + session that were
+        # active last run. Consumed once when that worktree is first activated.
+        self._restore_worktree = restore_worktree
+        self._restore_session = restore_session
         # Only ensure the "main" worktree EXISTS in state (cheap, needed before
         # compose builds the tabs). Its tmux session is created lazily and
         # off the event loop by WorktreeTabContent.on_mount — creating it here
@@ -186,9 +197,32 @@ class ProjectView(Widget):
     def state(self) -> AppState:
         return self._state
 
+    @property
+    def active_worktree_name(self) -> str | None:
+        return self._active_worktree.name if self._active_worktree else None
+
+    @property
+    def active_session_name(self) -> str | None:
+        return self._active_session_name
+
+    def _save_workspace(self) -> None:
+        """Ask the app to persist the workspace UI-state (best-effort)."""
+        save = getattr(self.app, "save_workspace_state", None)
+        if save is not None:
+            try:
+                save()
+            except Exception:
+                logger.debug("save_workspace_state failed", exc_info=True)
+
     def compose(self) -> ComposeResult:
         if self._state.worktrees:
-            with TabbedContent(id="tabs"):
+            # Open directly on the last-active worktree tab (workspace restore) so
+            # the framework never activates the first tab and then clobbers it —
+            # `initial` is the tab shown on mount. Falls back to the first tab.
+            initial = ""
+            if self._restore_worktree and self._state.get_worktree(self._restore_worktree):
+                initial = f"wt-{self._restore_worktree}"
+            with TabbedContent(id="tabs", initial=initial):
                 for wt in self._state.worktrees:
                     with TabPane(self._tab_label(wt), id=f"wt-{wt.name}"):
                         yield WorktreeTabContent(wt, self._config.remote, self._config.main_branch)
@@ -197,17 +231,39 @@ class ProjectView(Widget):
 
     def on_mount(self) -> None:
         if self._state.worktrees:
-            wt = self._state.worktrees[0]
+            # Restore the last-active worktree tab if it still exists; else the first.
+            target = (
+                self._state.get_worktree(self._restore_worktree)
+                if self._restore_worktree else None
+            )
+            wt = target or self._state.worktrees[0]
             self._active_worktree = wt
+            # Drop a restore-session hint that no longer exists in the worktree.
+            if self._restore_session and not any(
+                s.tmux_session_name == self._restore_session for s in wt.sessions
+            ):
+                self._restore_session = None
             if wt.sessions:
-                self._active_session_name = wt.sessions[0].tmux_session_name
+                self._active_session_name = self._restore_session or wt.sessions[0].tmux_session_name
 
             async def _initial_refresh():
                 await self._refresh_sidebar(wt)
-                self._set_active_worktree(wt)
+                # TabActivated for the initial tab also runs _set_active_worktree
+                # (consuming the restore session); calling it here too is safe and
+                # covers the no-restore case. preserve-current-session avoids clobber.
+                self._set_active_worktree(wt, session_name=self._consume_restore_session(wt))
                 self._start_state_watching()
 
             self.run_worker(_initial_refresh, exclusive=False)
+
+    def _consume_restore_session(self, wt: Worktree) -> str | None:
+        """Return the one-shot restore session for ``wt`` (if any), then clear it."""
+        if self._restore_worktree == wt.name and self._restore_session:
+            session = self._restore_session
+            self._restore_worktree = None
+            self._restore_session = None
+            return session
+        return None
 
     def _tab_label(self, wt: Worktree, git_data: tuple[dict, bool] | None = None) -> str:
         wt_states = {s.tmux_session_name: self._cached_session_states.get(s.tmux_session_name, SessionState.RUNNING) for s in wt.sessions}
@@ -285,7 +341,7 @@ class ProjectView(Widget):
         except Exception:
             pass
 
-    def _set_active_worktree(self, wt: Worktree) -> None:
+    def _set_active_worktree(self, wt: Worktree, session_name: str | None = None) -> None:
         # Pause the old worktree's terminal captures (keeps content + state watches)
         old_wt = self._active_worktree
         if old_wt and old_wt.name != wt.name:
@@ -296,7 +352,15 @@ class ProjectView(Widget):
                 pass
         self._active_worktree = wt
         if wt.sessions:
-            first = wt.sessions[0]
+            # Prefer an explicitly requested session (workspace restore); else keep
+            # the currently-active one if it lives in this worktree (so a redundant
+            # re-activation doesn't reset the selection); else fall back to the first.
+            chosen = None
+            if session_name:
+                chosen = next((s for s in wt.sessions if s.tmux_session_name == session_name), None)
+            if chosen is None and self._active_session_name:
+                chosen = next((s for s in wt.sessions if s.tmux_session_name == self._active_session_name), None)
+            first = chosen or wt.sessions[0]
             self._active_session_name = first.tmux_session_name
             self._activate_terminal(wt.name, first.tmux_session_name)
             self._update_app_subtitle(first.label)
@@ -325,7 +389,8 @@ class ProjectView(Widget):
             name = tab_id[3:]
             wt = self._state.get_worktree(name)
             if wt:
-                self._set_active_worktree(wt)
+                self._set_active_worktree(wt, session_name=self._consume_restore_session(wt))
+                self._save_workspace()
 
     def on_worktree_tab_content_initialized(
         self, event: "WorktreeTabContent.Initialized"
@@ -396,6 +461,7 @@ class ProjectView(Widget):
         except Exception:
             logger.debug("Failed to activate session in terminal pane", exc_info=True)
         self._update_app_subtitle(event.session.label)
+        self._save_workspace()
 
     async def on_session_deleted(self, event: SessionDeleted) -> None:
         wt = event.worktree
@@ -438,6 +504,7 @@ class ProjectView(Widget):
         cleanup_state_file(tmux_name)
         self._start_state_watching()  # Update watch list
         await asyncio.to_thread(save_state, self._state, self._config)
+        self._save_workspace()
 
     def on_git_action(self, event: GitAction) -> None:
         wt = event.worktree
@@ -547,6 +614,7 @@ class ProjectView(Widget):
                 await self._refresh_sidebar(wt)
                 self._activate_terminal(wt.name, session.tmux_session_name)
                 self._start_state_watching()  # Watch new session's state file
+                self._save_workspace()
                 self.app.notify(f"Created session: {session.label}")
 
             self.run_worker(_create_session, exclusive=False)
@@ -681,6 +749,7 @@ class ProjectView(Widget):
                 self._active_worktree = None
                 self._active_session_name = None
                 await self._remove_worktree_tab(wt.name)
+                self._save_workspace()
                 if git_err:
                     self.app.notify(
                         f"Removed '{wt.name}' from Super Worker (git cleanup skipped: {git_err[:80]})",
