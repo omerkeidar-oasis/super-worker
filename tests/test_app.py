@@ -5,6 +5,7 @@ Only the tmux server is mocked (external boundary) — all internal functions
 run for real against a redirected state directory.
 """
 
+import asyncio
 import shutil
 
 import git as gitpython
@@ -593,3 +594,69 @@ async def test_foreign_session_dropped_when_gone():
         pv.do_refresh()
         await pilot.pause(delay=1.0)
         assert not any(s.foreign for s in main.sessions)
+
+
+# ── Orphan sw-session adoption (repairs the clobber, prevents empty-on-open) ───
+
+
+@pytest.mark.asyncio
+async def test_sessionless_worktree_adopts_live_sw_session_not_empty():
+    """A worktree that's sessionless in state but has a LIVE sw session adopts it
+    on open (as a real, foreign=False session) instead of spawning an empty one."""
+    import super_worker.services.tmux as tmux_mod
+    from super_worker.services.tmux import _worktree_scope, tmux_session_name
+
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        pv = _pv(app)
+        await pilot.pause(delay=0.5)
+
+        wt = Worktree(name="adopt", path=str(pv._config.repo_root), branch="sw-adopt")
+        live_name = tmux_session_name("adopt", 0, _worktree_scope(wt))
+        server = tmux_mod._get_server()
+        live = MagicMock()
+        live.session_name = live_name
+        live.active_pane = MagicMock()
+        live.show_environment.return_value = {}
+        server.sessions.append(live)
+
+        pv._state.worktrees.append(wt)
+        await pv._add_worktree_tab(wt, activate=False)
+        await pilot.pause(delay=1.0)
+
+        # Adopted the live sw session; did NOT create a redundant empty one.
+        assert len(wt.sessions) == 1
+        assert wt.sessions[0].tmux_session_name == live_name
+        assert wt.sessions[0].foreign is False
+
+
+@pytest.mark.asyncio
+async def test_tui_persist_preserves_concurrently_added_session():
+    """End-to-end clobber regression: a session another process added to the
+    shared file survives a subsequent TUI write (merge, not overwrite)."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        pv = _pv(app)
+        await pilot.pause(delay=0.5)
+        main = pv._state.worktrees[0]
+
+        # Another process appends session S to main in the shared file; the TUI's
+        # in-memory state does NOT know about S.
+        disk = load_state(pv._config)
+        disk.get_worktree(main.name).sessions.append(
+            Session(tmux_session_name="sw-main-concurrent-0", label="S")
+        )
+        save_state(disk, pv._config)
+        assert all(s.tmux_session_name != "sw-main-concurrent-0" for s in main.sessions)
+
+        # The TUI now persists a change of its own (rename its existing session).
+        renamed = main.sessions[0]
+        from super_worker.services.state import update_session_label_in_state_file
+        await asyncio.to_thread(
+            update_session_label_in_state_file, pv._config, main.name, renamed.id, "renamed-by-tui"
+        )
+
+        after = load_state(pv._config).get_worktree(main.name)
+        names = {s.tmux_session_name for s in after.sessions}
+        assert "sw-main-concurrent-0" in names, "concurrent session S must not be clobbered"
+        assert any(s.id == renamed.id and s.label == "renamed-by-tui" for s in after.sessions)

@@ -25,11 +25,17 @@ from super_worker.screens import (
     RenameSessionScreen,
 )
 from super_worker.services.state import (
+    add_sessions_to_state_file,
+    add_worktree_to_state_file,
+    adopt_orphan_sw_sessions,
+    adopt_orphans_for_worktree,
     ensure_default_worktree,
     load_state,
     remove_session_from_state,
+    remove_session_from_state_file,
     remove_worktree_from_state,
-    save_state,
+    remove_worktree_from_state_file,
+    update_session_label_in_state_file,
 )
 from super_worker.services.tmux import (
     SessionState,
@@ -81,14 +87,18 @@ class WorktreeTabContent(Horizontal):
 
         Carries the first session's name so ProjectView can adopt it as active
         (the session is created asynchronously here, after ProjectView.on_mount
-        has already run), and ``created`` so state is persisted only when a new
-        session was actually made.
+        has already run), and ``new_session_names`` — the tmux names of sessions
+        this init CREATED or ADOPTED — so ProjectView can merge-persist exactly
+        those into the shared state file (never a blind whole-state overwrite).
         """
 
-        def __init__(self, worktree_name: str, first_session_name: str | None, created: bool) -> None:
+        def __init__(
+            self, worktree_name: str, first_session_name: str | None,
+            new_session_names: list[str],
+        ) -> None:
             self.worktree_name = worktree_name
             self.first_session_name = first_session_name
-            self.created = created
+            self.new_session_names = new_session_names
             super().__init__()
 
     DEFAULT_CSS = """
@@ -111,11 +121,17 @@ class WorktreeTabContent(Horizontal):
 
     def on_mount(self) -> None:
         async def _init_sidebar() -> None:
-            created = False
+            new_session_names: list[str] = []
+            if not self.worktree.sessions:
+                # First, re-adopt any LIVE sw session already running for this
+                # worktree (e.g. an `sw new`/`sw add` whose state was clobbered)
+                # so we don't spawn a redundant EMPTY session beside the real one.
+                adopted = await asyncio.to_thread(adopt_orphans_for_worktree, self.worktree)
+                new_session_names.extend(s.tmux_session_name for s in adopted)
             if not self.worktree.sessions:
                 session = await asyncio.to_thread(create_session, self.worktree)
                 self.worktree.sessions.append(session)
-                created = True
+                new_session_names.append(session.tmux_session_name)
 
             session_names = [s.tmux_session_name for s in self.worktree.sessions]
             states = await asyncio.to_thread(batch_detect_session_states, session_names) if session_names else {}
@@ -132,8 +148,8 @@ class WorktreeTabContent(Horizontal):
                 terminal.active_session = first_name
 
             # Let ProjectView (which owns state+config) adopt the active
-            # session and persist a newly-created one.
-            self.post_message(self.Initialized(self.worktree.name, first_name, created))
+            # session and merge-persist any newly created/adopted sessions.
+            self.post_message(self.Initialized(self.worktree.name, first_name, new_session_names))
 
         # Widget-node worker: auto-cancelled if this tab unmounts mid-init,
         # and immune to exclusive workers on the App node.
@@ -355,13 +371,20 @@ class ProjectView(Widget):
         ):
             self._active_session_name = event.first_session_name
             self._update_app_subtitle()
-        if event.created:
-            # Persist off the event loop; exclusive so concurrent tab inits
-            # don't write the shared state file at the same time.
-            self.run_worker(
-                lambda: save_state(self._state, self._config),
-                thread=True, group="persist-state", exclusive=True,
-            )
+        if event.new_session_names:
+            # Merge-persist this tab's worktree + the sessions it created/adopted
+            # — never a blind whole-state save, which would clobber another sw
+            # run's work. add_worktree_to_state_file adds the worktree if it's
+            # not in the file yet (the auto-created "main" worktree lives only in
+            # memory until now) and otherwise merges only the new sessions. The
+            # file lock serializes concurrent tab inits, so no exclusivity group
+            # is needed (and none is wanted — it would cancel a pending persist).
+            wt = self._state.get_worktree(event.worktree_name)
+            if wt is not None:
+                self.run_worker(
+                    lambda w=wt: add_worktree_to_state_file(self._config, w),
+                    thread=True, group="persist-state",
+                )
         self._start_state_watching()
 
     def on_terminal_pane_state_changed(self, event: TerminalPane.StateChanged) -> None:
@@ -446,10 +469,17 @@ class ProjectView(Widget):
             self._update_app_subtitle()
 
         self.app.notify(f"Deleted session: {session.label}")
-        await asyncio.to_thread(kill_session, tmux_name)
-        cleanup_state_file(tmux_name)
+        if not session.foreign:
+            # Foreign (external) sessions are display-only — sw never kills them
+            # and they were never persisted; removing from the in-memory view is
+            # enough (the next scan re-discovers them while they're still live).
+            await asyncio.to_thread(kill_session, tmux_name)
+            cleanup_state_file(tmux_name)
+            # Merge-remove only THIS session from the shared file.
+            await asyncio.to_thread(
+                remove_session_from_state_file, self._config, wt.name, session.id
+            )
         self._start_state_watching()  # Update watch list
-        await asyncio.to_thread(save_state, self._state, self._config)
 
     def on_git_action(self, event: GitAction) -> None:
         wt = event.worktree
@@ -510,7 +540,8 @@ class ProjectView(Widget):
                     skip_permissions=skip_permissions,
                 )
                 wt.sessions.append(session)
-            await asyncio.to_thread(save_state, self._state, self._config)
+            # Merge-add just this worktree (+ its session) into the shared file.
+            await asyncio.to_thread(add_worktree_to_state_file, self._config, wt)
             await self._add_worktree_tab(wt)
             self._start_state_watching()  # Watch new worktree's sessions
             self.app.notify(f"Created worktree: {name}")
@@ -558,7 +589,10 @@ class ProjectView(Widget):
                         skip_permissions=skip_perms, session_type=session_type,
                     )
                     wt.sessions.append(session)
-                    await asyncio.to_thread(save_state, self._state, self._config)
+                    # Merge-add just this new session into the shared file.
+                    await asyncio.to_thread(
+                        add_sessions_to_state_file, self._config, wt.name, [session]
+                    )
                 except Exception as e:
                     self.app.notify(str(e), severity="error")
                     return
@@ -588,7 +622,11 @@ class ProjectView(Widget):
             session.label = new_label
 
             async def _save_and_refresh() -> None:
-                await asyncio.to_thread(save_state, self._state, self._config)
+                # Merge-update only this session's label in the shared file.
+                await asyncio.to_thread(
+                    update_session_label_in_state_file,
+                    self._config, wt.name, session.id, new_label,
+                )
                 await self._refresh_sidebar(wt)
                 self.app.notify(f"Renamed session to: {new_label}")
 
@@ -697,7 +735,8 @@ class ProjectView(Widget):
                     logger.debug("git cleanup failed removing worktree %s", wt_name, exc_info=True)
 
                 self._state = remove_worktree_from_state(self._state, wt_name)
-                await asyncio.to_thread(save_state, self._state, self._config)
+                # Merge-remove just this worktree from the shared file.
+                await asyncio.to_thread(remove_worktree_from_state_file, self._config, wt_name)
                 self._active_worktree = None
                 self._active_session_name = None
                 await self._remove_worktree_tab(wt.name)
@@ -911,6 +950,22 @@ class ProjectView(Widget):
             await self._remove_worktree_tab(mwt.name)
             summary["worktrees_removed"] += 1
             changed = True
+
+        # Re-adopt live sw sessions that fell out of the file (crash / past
+        # clobber) as REAL sessions, and merge-persist them so they're durable
+        # and recoverable. Runs AFTER the disk merge above, so anything already
+        # in the file is tracked and won't be re-adopted.
+        adopted = await asyncio.to_thread(adopt_orphan_sw_sessions, self._state)
+        if adopted:
+            summary["sessions_added"] += len(adopted)
+            changed = True
+            by_wt: dict[str, list] = {}
+            for wt_name, sess in adopted:
+                by_wt.setdefault(wt_name, []).append(sess)
+            for wt_name, sessions in by_wt.items():
+                await asyncio.to_thread(
+                    add_sessions_to_state_file, self._config, wt_name, sessions
+                )
 
         if changed:
             self._start_state_watching()

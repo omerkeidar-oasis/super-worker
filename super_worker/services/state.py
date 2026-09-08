@@ -7,7 +7,7 @@ from pathlib import Path
 
 from super_worker.config import ResolvedConfig, detect_repo_root
 from super_worker.constants import STATE_DIR
-from super_worker.models import AppState
+from super_worker.models import AppState, Session, Worktree
 from super_worker.services.tmux import build_process_cmd, build_session_env_cmd, create_session, is_session_alive, respawn_pane, _get_server
 from super_worker.services.worktree import discover_worktrees, get_current_branch, prune_git_cache
 
@@ -175,6 +175,80 @@ def remove_session_from_state(state: AppState, worktree_name: str, session_id: s
     if wt:
         wt.sessions = [s for s in wt.sessions if s.id != session_id]
     return state
+
+
+# ── Merge-oriented writers (the TUI MUST use these, never a blind save) ────────
+#
+# The TUI keeps a long-lived in-memory AppState. Persisting it with a blind
+# save_state OVERWRITES the shared state file, silently wiping anything another
+# process (e.g. `sw new`/`sw add`) merged in since the TUI last read it. Each
+# writer below re-reads the current file under the exclusive lock (mutate_state)
+# and applies ONLY its specific delta, so concurrent writers are never lost.
+# Foreign (display-only) sessions are never written — mutate_state's freshly-read
+# state can't contain them, and _serialize_state filters them regardless.
+
+
+def add_sessions_to_state_file(
+    config: ResolvedConfig, worktree_name: str, sessions: list[Session]
+) -> None:
+    """Merge-append sessions to a worktree in the shared file (skip dups/foreign)."""
+    with mutate_state(config) as state:
+        wt = state.get_worktree(worktree_name)
+        if wt is None:
+            return  # worktree removed elsewhere — don't resurrect it
+        existing = {s.tmux_session_name for s in wt.sessions}
+        for s in sessions:
+            if s.foreign or s.tmux_session_name in existing:
+                continue
+            wt.sessions.append(s)
+            existing.add(s.tmux_session_name)
+
+
+def add_worktree_to_state_file(config: ResolvedConfig, worktree: Worktree) -> None:
+    """Merge-add a worktree (and its non-foreign sessions) to the shared file."""
+    with mutate_state(config) as state:
+        existing = state.get_worktree(worktree.name)
+        if existing is None:
+            # New worktree — append it. _serialize_state drops any foreign
+            # sessions on write, so the shared object can be appended as-is.
+            state.worktrees.append(worktree)
+            return
+        # Raced with another writer that already added this worktree — merge
+        # only our new sessions into the existing entry.
+        names = {s.tmux_session_name for s in existing.sessions}
+        for s in worktree.sessions:
+            if s.foreign or s.tmux_session_name in names:
+                continue
+            existing.sessions.append(s)
+            names.add(s.tmux_session_name)
+
+
+def update_session_label_in_state_file(
+    config: ResolvedConfig, worktree_name: str, session_id: str, label: str
+) -> None:
+    """Set a session's label in the shared file (found by id)."""
+    with mutate_state(config) as state:
+        wt = state.get_worktree(worktree_name)
+        if wt is None:
+            return
+        for s in wt.sessions:
+            if s.id == session_id:
+                s.label = label
+                return
+
+
+def remove_session_from_state_file(
+    config: ResolvedConfig, worktree_name: str, session_id: str
+) -> None:
+    """Remove a session from the shared file, preserving everything else."""
+    with mutate_state(config) as state:
+        remove_session_from_state(state, worktree_name, session_id)
+
+
+def remove_worktree_from_state_file(config: ResolvedConfig, name: str) -> None:
+    """Remove a worktree from the shared file, preserving everything else."""
+    with mutate_state(config) as state:
+        remove_worktree_from_state(state, name)
 
 
 def recover_dead_sessions(state: AppState) -> bool:
@@ -356,6 +430,69 @@ def dedupe_session_names(state: AppState) -> bool:
     return changed
 
 
+def adopt_orphans_for_worktree(
+    worktree: Worktree, live_names: set[str] | None = None
+) -> list[Session]:
+    """Adopt LIVE sw-created tmux sessions for ONE worktree back into its list.
+
+    A crash — or the old TUI blind-save that clobbered the shared file — can
+    leave a worktree with a live ``sw-<name>-<scope>-*`` tmux session that isn't
+    in ``worktree.sessions`` (an "orphan"). Without this, WorktreeTabContent
+    spawns a fresh EMPTY session beside the real one. Re-adopt each orphan as a
+    real, sw-managed session (``foreign=False`` → it persists and recovers).
+
+    Matching is by tmux name prefix: ``_worktree_scope`` is a hash of the
+    worktree PATH, so ``sw-<name>-<scope>-`` uniquely identifies THIS worktree
+    and can never collide with a different worktree's sessions. The original
+    ``claude_session_id`` is unrecoverable → ``None`` (recovery then falls back
+    to ``--continue``, the legacy id-less path). Session type is unknown →
+    assumed "claude" (the overwhelmingly common case). Returns the adopted
+    sessions (also appended to ``worktree.sessions``).
+    """
+    from super_worker.services.tmux import (
+        TMUX_SESSION_PREFIX, _default_session_label, _worktree_scope,
+    )
+
+    if live_names is None:
+        try:
+            live_names = {s.session_name for s in _get_server().sessions}
+        except Exception:
+            return []
+
+    scope = _worktree_scope(worktree)
+    prefix = f"{TMUX_SESSION_PREFIX}-{worktree.name}-{scope}-"
+    tracked = {s.tmux_session_name for s in worktree.sessions}
+    adopted: list[Session] = []
+    for name in sorted(live_names):
+        if not name.startswith(prefix) or name in tracked:
+            continue
+        sess = Session(
+            tmux_session_name=name,
+            label=_default_session_label(name),
+            session_type="claude",
+            claude_session_id=None,
+        )
+        worktree.sessions.append(sess)
+        tracked.add(name)
+        adopted.append(sess)
+        logger.info("Adopted orphaned sw session %s into worktree %s", name, worktree.name)
+    return adopted
+
+
+def adopt_orphan_sw_sessions(state: AppState) -> list[tuple[str, Session]]:
+    """Adopt live-but-untracked sw sessions across ALL worktrees. See
+    ``adopt_orphans_for_worktree``. Returns ``(worktree_name, session)`` pairs."""
+    try:
+        live_names = {s.session_name for s in _get_server().sessions}
+    except Exception:
+        return []
+    result: list[tuple[str, Session]] = []
+    for wt in state.worktrees:
+        for sess in adopt_orphans_for_worktree(wt, live_names=live_names):
+            result.append((wt.name, sess))
+    return result
+
+
 def reconcile_state(state: AppState, config: ResolvedConfig | None = None) -> bool:
     """Prune worktrees whose paths no longer exist, discover new ones. Returns True if changed."""
     changed = dedupe_session_names(state)
@@ -380,6 +517,11 @@ def reconcile_state(state: AppState, config: ResolvedConfig | None = None) -> bo
                 logger.info("Discovered worktree on disk", extra={"name": wt.name, "path": wt.path})
                 state.worktrees.append(wt)
                 changed = True
+
+    # Re-adopt live sw sessions that fell out of the file (crash / past clobber)
+    # so sessionless worktrees are non-empty before their tab spawns an empty one.
+    if adopt_orphan_sw_sessions(state):
+        changed = True
 
     return changed
 

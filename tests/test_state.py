@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -7,14 +8,20 @@ from super_worker.models import AppState, Session, Worktree
 from super_worker.services.state import (
     _migrate_data,
     _state_file_for,
+    add_sessions_to_state_file,
+    add_worktree_to_state_file,
+    adopt_orphan_sw_sessions,
     load_projects_registry,
     load_state,
     reconcile_state,
     recover_dead_sessions,
     remove_session_from_state,
+    remove_session_from_state_file,
     remove_worktree_from_state,
+    remove_worktree_from_state_file,
     save_state,
     update_projects_registry,
+    update_session_label_in_state_file,
 )
 
 
@@ -552,3 +559,171 @@ class TestForeignSessionsExcluded:
         # Two foreign sessions can share a real tmux name — sw must NOT rename them.
         assert dedupe_session_names(state) is False
         assert [s.tmux_session_name for s in wt.sessions] == ["ext-claude", "ext-claude"]
+
+
+class TestMergeWriters:
+    """The TUI's merge-oriented writers apply only their delta under the lock,
+    never clobbering another process's concurrent changes to the shared file."""
+
+    def _seed(self, fake_config, sessions):
+        wt = Worktree(name="W", path="/tmp/W", branch="sw-W", sessions=sessions)
+        save_state(
+            AppState(repo_root=str(fake_config.repo_root),
+                     worktree_base=str(fake_config.base_dir), worktrees=[wt]),
+            fake_config,
+        )
+        return wt
+
+    @pytest.mark.usefixtures("_redirect_state_dir")
+    def test_add_session_preserves_concurrent_session(self, fake_config):
+        # Another process wrote W with session S.
+        self._seed(fake_config, [Session(tmux_session_name="sw-W-x-0", label="S")])
+        # The (stale) TUI, unaware of S, adds session T via the merge writer.
+        add_sessions_to_state_file(
+            fake_config, "W", [Session(tmux_session_name="sw-W-x-1", label="T")]
+        )
+        names = {s.tmux_session_name for s in load_state(fake_config).worktrees[0].sessions}
+        assert names == {"sw-W-x-0", "sw-W-x-1"}, "S must survive — merge, not overwrite"
+
+    @pytest.mark.usefixtures("_redirect_state_dir")
+    def test_add_session_skips_duplicate(self, fake_config):
+        self._seed(fake_config, [Session(tmux_session_name="sw-W-x-0", label="S")])
+        add_sessions_to_state_file(
+            fake_config, "W", [Session(tmux_session_name="sw-W-x-0", label="dup")]
+        )
+        sessions = load_state(fake_config).worktrees[0].sessions
+        assert len(sessions) == 1 and sessions[0].label == "S"
+
+    @pytest.mark.usefixtures("_redirect_state_dir")
+    def test_add_session_never_persists_foreign(self, fake_config):
+        self._seed(fake_config, [Session(tmux_session_name="sw-W-x-0", label="S")])
+        add_sessions_to_state_file(
+            fake_config, "W", [Session(tmux_session_name="ext", label="e", foreign=True)]
+        )
+        names = {s.tmux_session_name for s in load_state(fake_config).worktrees[0].sessions}
+        assert names == {"sw-W-x-0"}
+
+    @pytest.mark.usefixtures("_redirect_state_dir")
+    def test_add_worktree_preserves_others_and_merges_sessions(self, fake_config):
+        self._seed(fake_config, [Session(tmux_session_name="sw-W-x-0", label="S")])
+        # A brand-new worktree from another action.
+        new = Worktree(name="V", path="/tmp/V", branch="sw-V",
+                       sessions=[Session(tmux_session_name="sw-V-y-0", label="v0")])
+        add_worktree_to_state_file(fake_config, new)
+        loaded = load_state(fake_config)
+        assert {w.name for w in loaded.worktrees} == {"W", "V"}
+        # Re-adding W with an extra session merges (doesn't duplicate W or drop S).
+        w2 = Worktree(name="W", path="/tmp/W", branch="sw-W", sessions=[
+            Session(tmux_session_name="sw-W-x-0", label="S"),
+            Session(tmux_session_name="sw-W-x-1", label="T"),
+        ])
+        add_worktree_to_state_file(fake_config, w2)
+        loaded = load_state(fake_config)
+        w = loaded.get_worktree("W")
+        assert {s.tmux_session_name for s in w.sessions} == {"sw-W-x-0", "sw-W-x-1"}
+        assert len([x for x in loaded.worktrees if x.name == "W"]) == 1
+
+    @pytest.mark.usefixtures("_redirect_state_dir")
+    def test_remove_session_preserves_concurrent_session(self, fake_config):
+        self._seed(fake_config, [
+            Session(id="s0", tmux_session_name="sw-W-x-0", label="S"),
+            Session(id="s1", tmux_session_name="sw-W-x-1", label="T"),
+        ])
+        remove_session_from_state_file(fake_config, "W", "s0")
+        names = {s.tmux_session_name for s in load_state(fake_config).worktrees[0].sessions}
+        assert names == {"sw-W-x-1"}
+
+    @pytest.mark.usefixtures("_redirect_state_dir")
+    def test_update_label_merges(self, fake_config):
+        self._seed(fake_config, [Session(id="s0", tmux_session_name="sw-W-x-0", label="old")])
+        update_session_label_in_state_file(fake_config, "W", "s0", "new")
+        assert load_state(fake_config).worktrees[0].sessions[0].label == "new"
+
+    @pytest.mark.usefixtures("_redirect_state_dir")
+    def test_remove_worktree_merges(self, fake_config):
+        wt = Worktree(name="W", path="/tmp/W", branch="sw-W")
+        wt2 = Worktree(name="V", path="/tmp/V", branch="sw-V")
+        save_state(
+            AppState(repo_root=str(fake_config.repo_root),
+                     worktree_base=str(fake_config.base_dir), worktrees=[wt, wt2]),
+            fake_config,
+        )
+        remove_worktree_from_state_file(fake_config, "W")
+        assert {w.name for w in load_state(fake_config).worktrees} == {"V"}
+
+
+class TestAdoptOrphanSwSessions:
+    """Live sw sessions that fell out of state are re-adopted as real sessions."""
+
+    def _mock_live(self, monkeypatch, names):
+        import super_worker.services.state as sm
+        server = MagicMock()
+        server.sessions = [MagicMock(session_name=n) for n in names]
+        monkeypatch.setattr(sm, "_get_server", lambda: server)
+
+    def test_adopts_matching_live_session(self, monkeypatch):
+        from super_worker.services.tmux import _worktree_scope, tmux_session_name
+        wt = Worktree(name="feat", path="/tmp/feat", branch="sw-feat")  # sessionless
+        name = tmux_session_name("feat", 0, _worktree_scope(wt))
+        self._mock_live(monkeypatch, [name])
+        state = AppState(repo_root="/r", worktree_base="/b", worktrees=[wt])
+
+        adopted = adopt_orphan_sw_sessions(state)
+
+        assert [n for _, n in [(w, s.tmux_session_name) for w, s in adopted]] == [name]
+        assert len(wt.sessions) == 1
+        s = wt.sessions[0]
+        assert s.tmux_session_name == name
+        assert s.foreign is False and s.claude_session_id is None
+
+    def test_does_not_adopt_other_worktrees_session(self, monkeypatch):
+        from super_worker.services.tmux import _worktree_scope, tmux_session_name
+        other = Worktree(name="feat", path="/tmp/OTHER", branch="sw-feat")
+        foreign_name = tmux_session_name("feat", 0, _worktree_scope(other))  # different scope
+        wt = Worktree(name="feat", path="/tmp/feat", branch="sw-feat")
+        self._mock_live(monkeypatch, [foreign_name])
+        state = AppState(repo_root="/r", worktree_base="/b", worktrees=[wt])
+        assert adopt_orphan_sw_sessions(state) == []
+        assert wt.sessions == []
+
+    def test_does_not_double_count_tracked(self, monkeypatch):
+        from super_worker.services.tmux import _worktree_scope, tmux_session_name
+        wt = Worktree(name="feat", path="/tmp/feat", branch="sw-feat")
+        name = tmux_session_name("feat", 0, _worktree_scope(wt))
+        wt.sessions.append(Session(tmux_session_name=name, label="already"))
+        self._mock_live(monkeypatch, [name])
+        state = AppState(repo_root="/r", worktree_base="/b", worktrees=[wt])
+        assert adopt_orphan_sw_sessions(state) == []
+        assert len(wt.sessions) == 1
+
+
+@pytest.mark.skipif(__import__("shutil").which("tmux") is None, reason="tmux not installed")
+class TestAdoptOrphanRealTmux:
+    """End-to-end orphan adoption against a REAL tmux on an isolated socket."""
+
+    @pytest.fixture
+    def tmux_server(self, monkeypatch):
+        import libtmux
+        import super_worker.services.tmux as tmux_mod
+        server = libtmux.Server(socket_name="sw-test-orphan-adopt")
+        monkeypatch.setattr(tmux_mod, "_server", server)
+        yield server
+        try:
+            server.kill()
+        except Exception:
+            pass
+
+    def test_live_sw_session_adopted_into_sessionless_worktree(self, tmux_server, tmp_path):
+        from super_worker.services.tmux import _worktree_scope, tmux_session_name
+        wt_dir = tmp_path / "feat"
+        wt_dir.mkdir()
+        wt = Worktree(name="feat", path=str(wt_dir), branch="sw-feat")  # sessionless in state
+        name = tmux_session_name("feat", 0, _worktree_scope(wt))
+        tmux_server.new_session(session_name=name, start_directory=str(wt_dir))
+        state = AppState(repo_root=str(tmp_path), worktree_base=str(tmp_path), worktrees=[wt])
+
+        adopted = adopt_orphan_sw_sessions(state)
+
+        assert len(adopted) == 1
+        assert wt.sessions[0].tmux_session_name == name
+        assert wt.sessions[0].foreign is False

@@ -737,8 +737,14 @@ def kill_session(tmux_session_name: str) -> None:
 
 
 def kill_all_sessions(worktree: Worktree) -> None:
-    """Kill all tmux sessions for a worktree."""
+    """Kill all sw tmux sessions for a worktree.
+
+    Foreign (adopted, non-sw) sessions are display-only — sw never kills them,
+    even when their worktree is deleted.
+    """
     for session in worktree.sessions:
+        if getattr(session, "foreign", False):
+            continue
         kill_session(session.tmux_session_name)
 
 
