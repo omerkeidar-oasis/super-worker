@@ -16,6 +16,25 @@ def _reset_tmux_caches():
     _tmux_mod._pane_cache.clear()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_ui_state(tmp_path, monkeypatch):
+    """Redirect the workspace UI-state file to a temp dir and reset the
+    class-level sidebar width for every test.
+
+    Without this, app-level tests write the real ``~/.config/sw/ui-state.json``
+    and leak a restorable project/session into later tests (e.g. an "active
+    session" appearing where a test expected none).
+    """
+    monkeypatch.setattr(
+        "super_worker.services.ui_state.STATE_DIR", tmp_path / "sw-ui-state"
+    )
+    from super_worker.widgets.sidebar import SidebarDivider
+
+    SidebarDivider._shared_width = None
+    yield
+    SidebarDivider._shared_width = None
+
+
 @pytest.fixture()
 def fake_config(tmp_path: Path) -> ResolvedConfig:
     repo_root = tmp_path / "repo"

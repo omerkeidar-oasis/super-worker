@@ -25,9 +25,20 @@ from super_worker.screens import (
 )
 from super_worker.models import Session, Worktree
 from super_worker.services.state import load_state, save_state
+from super_worker.services.ui_state import UIState, load_ui_state, save_ui_state
 from super_worker.widgets.project_view import WorktreeTabContent
-from super_worker.widgets.sidebar import SessionDeleted
+from super_worker.widgets.sidebar import SessionDeleted, SidebarDivider
 from super_worker.widgets.terminal_pane import TerminalPane
+
+
+class _FakeMouse:
+    """Minimal stand-in for a Textual MouseEvent (only what the divider reads)."""
+
+    def __init__(self, screen_x: int) -> None:
+        self.screen_x = screen_x
+
+    def stop(self) -> None:
+        pass
 
 
 def _make_mock_server():
@@ -47,9 +58,19 @@ def _make_mock_server():
 @pytest.fixture(autouse=True)
 def isolate_externals(tmp_path, monkeypatch):
     """Mock only the tmux server and redirect state dir — everything else is real."""
+    from super_worker.widgets.sidebar import SidebarDivider
+
     state_dir = tmp_path / "sw-state"
     state_dir.mkdir()
     monkeypatch.setattr("super_worker.services.state.STATE_DIR", state_dir)
+    # Redirect the workspace UI-state file too, so tests never read/write the
+    # real ~/.config/sw/ui-state.json (which would also reopen the user's real
+    # projects on startup).
+    monkeypatch.setattr("super_worker.services.ui_state.STATE_DIR", state_dir)
+
+    # Sidebar width is class-level state seeded from ui-state — reset it so a
+    # value from another test can't leak in.
+    monkeypatch.setattr(SidebarDivider, "_shared_width", None)
 
     mock_server = _make_mock_server()
     monkeypatch.setattr("super_worker.services.tmux.libtmux.Server", lambda: mock_server)
@@ -417,6 +438,62 @@ async def test_delete_gone_worktree_still_closes_tab(monkeypatch):
         assert app.is_running
 
 
+# ── Workspace persistence ──────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_workspace_state_saved_on_startup():
+    """Startup persists the launch project into the workspace UI-state file."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        await pilot.pause(delay=1.0)
+        repo = str(_pv(app).config.repo_root)
+        ui = load_ui_state()
+        assert repo in ui.open_projects
+        assert repo in ui.projects
+
+
+@pytest.mark.asyncio
+async def test_sidebar_width_persisted_on_drag_end():
+    """Releasing a divider drag writes the chosen width to the UI-state file."""
+    app = SuperWorkerApp()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(delay=1.0)
+        divider = app.query_one(SidebarDivider)
+        divider.on_mouse_down(_FakeMouse(50))
+        divider.on_mouse_move(_FakeMouse(50))
+        await pilot.pause()
+        divider.on_mouse_up(_FakeMouse(50))
+        await pilot.pause()
+
+        ui = load_ui_state()
+        assert ui.sidebar_width is not None
+        assert ui.sidebar_width == SidebarDivider._shared_width
+
+
+@pytest.mark.asyncio
+async def test_sidebar_width_restored_on_startup():
+    """A persisted sidebar width is applied to the sidebar on the next launch."""
+    save_ui_state(UIState(sidebar_width=40))
+    app = SuperWorkerApp()
+    # __init__ seeds the class-level width from the UI-state file.
+    assert SidebarDivider._shared_width == 40
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(delay=1.0)
+        from super_worker.widgets.sidebar import SessionSidebar
+        assert app.query_one(SessionSidebar).region.width == 40
+
+
+@pytest.mark.asyncio
+async def test_restore_skips_nonexistent_project():
+    """A previously-open project whose path is gone is skipped, not reopened."""
+    save_ui_state(UIState(open_projects=["/nonexistent/repo-xyz"]))
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        await pilot.pause(delay=1.0)
+        assert app.is_running
+        open_paths = {str(c.repo_root) for c in app._open_configs}
+        assert "/nonexistent/repo-xyz" not in open_paths
 # ── Live-sync from the shared state file (F5 / periodic) ──────────────────────
 
 
