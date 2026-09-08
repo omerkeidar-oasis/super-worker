@@ -4,6 +4,8 @@ import asyncio
 import logging
 import shlex
 import subprocess
+from pathlib import Path
+
 from textual.app import ComposeResult
 from textual.containers import Horizontal
 from textual.message import Message
@@ -24,6 +26,7 @@ from super_worker.screens import (
 )
 from super_worker.services.state import (
     ensure_default_worktree,
+    load_state,
     remove_session_from_state,
     remove_worktree_from_state,
     save_state,
@@ -505,7 +508,14 @@ class ProjectView(Widget):
 
         self.run_worker(_create, exclusive=False)
 
-    async def _add_worktree_tab(self, wt: Worktree) -> None:
+    async def _add_worktree_tab(self, wt: Worktree, activate: bool = True) -> None:
+        """Add a tab for ``wt``.
+
+        With ``activate=False`` the tab is added WITHOUT stealing focus or
+        changing the current tab — used when the worktree was discovered from
+        the shared state file (created by another sw run), where forcing focus
+        would yank the user off whatever they were doing.
+        """
         try:
             empty = self.query_one("#empty-state", Static)
             await empty.remove()
@@ -517,8 +527,9 @@ class ProjectView(Widget):
         pane = TabPane(self._tab_label(wt), id=f"wt-{wt.name}")
         pane.compose_add_child(WorktreeTabContent(wt, self._config.remote, self._config.main_branch))
         await tabs.add_pane(pane)
-        tabs.active = f"wt-{wt.name}"
-        self._set_active_worktree(wt)
+        if activate:
+            tabs.active = f"wt-{wt.name}"
+            self._set_active_worktree(wt)
 
     def do_new_session(self) -> None:
         if not self._active_worktree:
@@ -750,10 +761,16 @@ class ProjectView(Widget):
 
         State detection is event-driven via kqueue on state files (see
         on_terminal_pane_state_changed). This method only handles:
+        - Live-sync of worktrees/sessions from the shared state file (other sw runs)
         - Git status (no event source, must poll)
         - Dead session detection (lightweight alive check, no show_environment)
         - Syncing state cache from state files for sessions without kqueue watches
         """
+        # Merge anything created by another sw run (or a foreign session started
+        # outside sw) into the live state first, so the git/session passes below
+        # see the freshly-added worktrees/sessions in this same tick.
+        await self._sync_from_disk()
+
         all_session_names = [s.tmux_session_name for wt in self._state.worktrees for s in wt.sessions]
         if all_session_names:
             # Lightweight: single list-sessions + pane_dead check (no show_environment)
@@ -812,6 +829,105 @@ class ProjectView(Widget):
 
         for wt in self._state.worktrees:
             self._refresh_tab_label(wt, git_data=git_data.get(wt.name))
+
+    # ── Live sync from the shared state file ──────────────────────────────────
+
+    async def _sync_from_disk(self) -> dict[str, int]:
+        """Merge worktrees/sessions from the shared state file into live state.
+
+        The persisted state file is the source of truth shared across every sw
+        process, but the running TUI only read it at startup — so a worktree or
+        session created by another ``sw`` run never appeared until reopen. This
+        reloads it (off the event loop) and merges ADDITIVELY:
+
+        - a worktree in the file we don't track → append it + add a tab WITHOUT
+          stealing focus (and start watching its sessions);
+        - a session in a worktree we DO track, not in memory by tmux name →
+          append it so the sidebar shows it;
+        - a worktree we track that's gone from the file AND whose path no longer
+          exists → drop its tab.
+
+        In-memory sessions absent from the file are deliberately KEPT: a session
+        we just created may not be persisted yet, and dropping it here would race
+        that write. Dead sessions are handled elsewhere (recovery / dead check).
+        """
+        summary = {"worktrees_added": 0, "sessions_added": 0, "worktrees_removed": 0}
+        try:
+            disk = await asyncio.to_thread(load_state, self._config)
+        except Exception:
+            logger.debug("Failed to reload shared state for live-sync", exc_info=True)
+            return summary
+
+        disk_by_name = {wt.name: wt for wt in disk.worktrees}
+        mem_names = {wt.name for wt in self._state.worktrees}
+        changed = False
+
+        # NEW worktrees on disk → append + add a tab without changing focus.
+        for name, dwt in disk_by_name.items():
+            if name not in mem_names:
+                self._state.worktrees.append(dwt)
+                await self._add_worktree_tab(dwt, activate=False)
+                summary["worktrees_added"] += 1
+                changed = True
+
+        # NEW sessions inside worktrees we already track.
+        for mwt in self._state.worktrees:
+            dwt = disk_by_name.get(mwt.name)
+            if dwt is None:
+                continue
+            known = {s.tmux_session_name for s in mwt.sessions}
+            for s in dwt.sessions:
+                if s.tmux_session_name not in known:
+                    mwt.sessions.append(s)
+                    known.add(s.tmux_session_name)
+                    summary["sessions_added"] += 1
+                    changed = True
+
+        # REMOVED worktrees: tracked, absent from the file, AND path is gone.
+        for mwt in list(self._state.worktrees):
+            if mwt.name in disk_by_name:
+                continue
+            if await asyncio.to_thread(lambda p=mwt.path: Path(p).exists()):
+                continue  # not in the file yet, but still on disk — keep it
+            if self._active_worktree and self._active_worktree.name == mwt.name:
+                self._active_worktree = None
+                self._active_session_name = None
+            self._state.worktrees = [w for w in self._state.worktrees if w.name != mwt.name]
+            await self._remove_worktree_tab(mwt.name)
+            summary["worktrees_removed"] += 1
+            changed = True
+
+        if changed:
+            self._start_state_watching()
+        return summary
+
+    def do_refresh(self) -> None:
+        """Manually run the live-sync now and notify the result (F5)."""
+        async def _refresh() -> None:
+            summary = await self._sync_from_disk()
+            # Repaint git/session state so newly-merged rows render immediately.
+            await self._periodic_refresh_impl()
+            self.app.notify(self._refresh_summary(summary, foreign=0))
+
+        self.run_worker(_refresh, exclusive=False)
+
+    @staticmethod
+    def _refresh_summary(summary: dict[str, int], foreign: int) -> str:
+        added_wt = summary["worktrees_added"]
+        added_sess = summary["sessions_added"]
+        removed_wt = summary["worktrees_removed"]
+        if not (added_wt or added_sess or removed_wt or foreign):
+            return "Refreshed — nothing new"
+        bits = []
+        if added_wt:
+            bits.append(f"+{added_wt} worktree{'s' if added_wt != 1 else ''}")
+        if added_sess:
+            bits.append(f"+{added_sess} session{'s' if added_sess != 1 else ''}")
+        if foreign:
+            bits.append(f"{foreign} external")
+        if removed_wt:
+            bits.append(f"-{removed_wt} worktree{'s' if removed_wt != 1 else ''}")
+        return "Refreshed: " + ", ".join(bits)
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 

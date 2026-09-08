@@ -22,7 +22,8 @@ from super_worker.screens import (
     NewWorktreeScreen,
     RenameSessionScreen,
 )
-from super_worker.models import Worktree
+from super_worker.models import Session, Worktree
+from super_worker.services.state import load_state, save_state
 from super_worker.widgets.project_view import WorktreeTabContent
 from super_worker.widgets.sidebar import SessionDeleted
 from super_worker.widgets.terminal_pane import TerminalPane
@@ -413,3 +414,100 @@ async def test_delete_gone_worktree_still_closes_tab(monkeypatch):
         assert pv._state.get_worktree("feat") is None, "worktree removed from state despite git error"
         assert not list(pv.query("#wt-feat")), "tab closed despite git cleanup failing"
         assert app.is_running
+
+
+# ── Live-sync from the shared state file (F5 / periodic) ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_f5_syncs_new_worktree_from_disk(tmp_path):
+    """A worktree written to the shared state file by another sw run shows up
+    on refresh, as a new tab, WITHOUT stealing the active tab."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        pv = _pv(app)
+        await pilot.pause(delay=0.5)  # let startup's own state save settle first
+        active_before = pv._active_worktree.name if pv._active_worktree else None
+
+        # Simulate another sw process adding a worktree to the shared file.
+        other_dir = tmp_path / "other-wt"
+        other_dir.mkdir()
+        disk = load_state(pv._config)
+        disk.worktrees.append(Worktree(name="fromdisk", path=str(other_dir), branch="sw-fromdisk"))
+        save_state(disk, pv._config)
+
+        await pilot.press("f5")
+        await pilot.pause(delay=1.0)
+
+        assert pv._state.get_worktree("fromdisk") is not None
+        assert list(pv.query("#wt-fromdisk")), "a tab should have been added"
+        # Focus/active tab must NOT have been hijacked by the discovery.
+        assert (pv._active_worktree.name if pv._active_worktree else None) == active_before
+
+
+@pytest.mark.asyncio
+async def test_refresh_syncs_new_session_into_existing_worktree():
+    """A session added to an existing worktree's file entry appears in its sidebar."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        pv = _pv(app)
+        await pilot.pause(delay=0.5)  # let startup's own state save settle first
+        main = pv._state.worktrees[0]
+        before = {s.tmux_session_name for s in main.sessions}
+
+        disk = load_state(pv._config)
+        disk_main = disk.get_worktree(main.name)
+        injected = Session(tmux_session_name="sw-main-injected-9", label="external-run")
+        disk_main.sessions.append(injected)
+        save_state(disk, pv._config)
+
+        pv.do_refresh()
+        await pilot.pause(delay=1.0)
+
+        names = {s.tmux_session_name for s in main.sessions}
+        assert "sw-main-injected-9" in names
+        assert names > before
+
+
+@pytest.mark.asyncio
+async def test_refresh_drops_worktree_whose_path_is_gone():
+    """A worktree tracked in memory but absent from the file AND whose path no
+    longer exists is dropped on refresh."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        pv = _pv(app)
+        ghost = Worktree(name="ghost", path="/nonexistent/ghost-wt", branch="sw-ghost")
+        pv._state.worktrees.append(ghost)
+        await pv._add_worktree_tab(ghost, activate=False)
+        await pilot.pause(delay=0.5)
+        assert list(pv.query("#wt-ghost")), "tab exists before refresh"
+
+        # Adding the tab persisted ghost to disk; simulate another process
+        # having removed it from the shared file (its dir is already gone).
+        disk = load_state(pv._config)
+        disk.worktrees = [w for w in disk.worktrees if w.name != "ghost"]
+        save_state(disk, pv._config)
+
+        pv.do_refresh()
+        await pilot.pause(delay=1.0)
+
+        assert pv._state.get_worktree("ghost") is None
+        assert not list(pv.query("#wt-ghost")), "gone worktree's tab was dropped"
+
+
+@pytest.mark.asyncio
+async def test_refresh_keeps_unpersisted_local_session():
+    """Refresh must NOT drop an in-memory session that isn't in the file yet
+    (it may just not be persisted — dropping it would race the write)."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        pv = _pv(app)
+        main = pv._state.worktrees[0]
+        local = Session(tmux_session_name="sw-main-local-77", label="not-yet-saved")
+        main.sessions.append(local)
+
+        pv.do_refresh()
+        await pilot.pause(delay=1.0)
+
+        names = {s.tmux_session_name for s in main.sessions}
+        assert "sw-main-local-77" in names
