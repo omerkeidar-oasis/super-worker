@@ -511,3 +511,85 @@ async def test_refresh_keeps_unpersisted_local_session():
 
         names = {s.tmux_session_name for s in main.sessions}
         assert "sw-main-local-77" in names
+
+
+# ── Adopting foreign (non-sw) tmux sessions ───────────────────────────────────
+
+
+def _inject_foreign_session(worktree_path: str, name: str = "cc-manual"):
+    """Append a mock non-sw 'claude' tmux session in ``worktree_path`` to the
+    shared mock server and return it."""
+    import super_worker.services.tmux as tmux_mod
+    server = tmux_mod._get_server()
+    foreign = MagicMock()
+    foreign.session_name = name
+    pane = MagicMock()
+    pane.pane_current_path = worktree_path
+    pane.pane_current_command = "claude"
+    foreign.active_pane = pane
+    foreign.show_environment.return_value = {}
+    server.sessions.append(foreign)
+    return server, foreign
+
+
+@pytest.mark.asyncio
+async def test_foreign_session_surfaced_tagged_and_not_persisted():
+    """A non-sw claude session in a worktree dir is surfaced, tagged [ext],
+    not double-counted on re-scan, and never written to the state file."""
+    from rich.text import Text
+    from super_worker.widgets.sidebar import SessionSidebar
+    from textual.widgets import Label, ListView
+
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        pv = _pv(app)
+        await pilot.pause(delay=0.5)
+        main = pv._state.worktrees[0]
+        _inject_foreign_session(str(main.path))
+
+        pv.do_refresh()
+        await pilot.pause(delay=1.0)
+
+        foreign = [s for s in main.sessions if s.foreign]
+        assert len(foreign) == 1
+        assert foreign[0].tmux_session_name == "cc-manual"
+
+        # Re-scan must not double-count (existing foreign object is reused).
+        pv.do_refresh()
+        await pilot.pause(delay=1.0)
+        assert len([s for s in main.sessions if s.foreign]) == 1
+
+        # Sidebar renders it with the [ext] tag.
+        wtc = pv.query_one(f"#wtc-{main.name}", WorktreeTabContent)
+        sidebar = wtc.query_one(SessionSidebar)
+        labels = []
+        for lbl in sidebar.query_one("#session-list", ListView).query(Label):
+            r = lbl.render()
+            labels.append(r.plain if hasattr(r, "plain") else Text.from_markup(str(r)).plain)
+        assert any("ext" in text for text in labels), labels
+
+        # Foreign sessions are DISPLAY-ONLY — never persisted to the state file.
+        disk = load_state(pv._config)
+        disk_names = {s.tmux_session_name for w in disk.worktrees for s in w.sessions}
+        assert "cc-manual" not in disk_names
+
+
+@pytest.mark.asyncio
+async def test_foreign_session_dropped_when_gone():
+    """A foreign session is re-discovered each scan and dropped once it's gone."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        pv = _pv(app)
+        await pilot.pause(delay=0.5)
+        main = pv._state.worktrees[0]
+        server, foreign = _inject_foreign_session(str(main.path))
+
+        pv.do_refresh()
+        await pilot.pause(delay=1.0)
+        assert any(s.foreign for s in main.sessions)
+
+        # The foreign tmux session ends — next scan must drop it.
+        server.sessions.remove(foreign)
+        pv.do_refresh()
+        await pilot.pause(delay=1.0)
+        assert not any(s.foreign for s in main.sessions)

@@ -487,3 +487,68 @@ class TestResumePerSession:
         monkeypatch.setattr(sm, "respawn_pane", lambda name, cmd: cap.setdefault("cmd", cmd) or True)
         assert sm.recover_dead_sessions(state) is True
         assert "--continue" in cap["cmd"]
+
+
+class TestForeignSessionsExcluded:
+    """Foreign (adopted, non-sw) sessions are display-only: never persisted,
+    never recovered, never renamed by dedupe."""
+
+    @pytest.mark.usefixtures("_redirect_state_dir")
+    def test_save_state_excludes_foreign(self, fake_config):
+        wt = Worktree(name="feat", path="/tmp/feat", branch="sw-feat", sessions=[
+            Session(tmux_session_name="sw-feat-0", label="mine"),
+            Session(tmux_session_name="ext-claude", label="ext", foreign=True),
+        ])
+        state = AppState(
+            repo_root=str(fake_config.repo_root),
+            worktree_base=str(fake_config.base_dir),
+            worktrees=[wt],
+        )
+        save_state(state, fake_config)
+
+        # In-memory objects are untouched (filtered into a copy, not mutated).
+        assert len(wt.sessions) == 2
+
+        loaded = load_state(fake_config)
+        names = {s.tmux_session_name for s in loaded.worktrees[0].sessions}
+        assert names == {"sw-feat-0"}, "foreign session must not be persisted"
+
+    @pytest.mark.usefixtures("_redirect_state_dir")
+    def test_serialized_state_omits_foreign_field(self, fake_config):
+        from super_worker.services.state import _serialize_state
+        wt = Worktree(name="feat", path="/tmp/feat", branch="sw-feat", sessions=[
+            Session(tmux_session_name="sw-feat-0", label="mine"),
+        ])
+        state = AppState(repo_root="/r", worktree_base="/b", worktrees=[wt])
+        # The on-disk shape stays exactly as before — no stray "foreign" key.
+        assert '"foreign"' not in _serialize_state(state)
+
+    def test_recover_skips_foreign(self, tmp_path, monkeypatch):
+        import super_worker.services.state as sm
+        repo = tmp_path / "repo"; repo.mkdir()
+        wt = Worktree(name="main", path=str(repo), branch="main", sessions=[
+            Session(tmux_session_name="ext-claude", label="ext", foreign=True),
+            Session(tmux_session_name="sw-main-0", label="mine", claude_session_id="c0"),
+        ])
+        state = AppState(repo_root=str(repo), worktree_base=str(tmp_path), worktrees=[wt])
+        checked = []
+        monkeypatch.setattr(sm, "is_session_alive", lambda name: checked.append(name) or False)
+        monkeypatch.setattr(sm, "_conversation_exists", lambda path, sid: True)
+        monkeypatch.setattr(sm, "respawn_pane", lambda name, cmd: True)
+
+        sm.recover_dead_sessions(state)
+
+        # The foreign session is never alive-checked, never recovered, and stays.
+        assert "ext-claude" not in checked
+        assert any(s.tmux_session_name == "ext-claude" and s.foreign for s in wt.sessions)
+
+    def test_dedupe_skips_foreign(self, _redirect_state_dir):
+        from super_worker.services.state import dedupe_session_names
+        wt = Worktree(name="main", path="/tmp/x", branch="main", sessions=[
+            Session(tmux_session_name="ext-claude", label="ext", foreign=True),
+            Session(tmux_session_name="ext-claude", label="ext2", foreign=True),
+        ])
+        state = AppState(repo_root="/r", worktree_base="/b", worktrees=[wt])
+        # Two foreign sessions can share a real tmux name — sw must NOT rename them.
+        assert dedupe_session_names(state) is False
+        assert [s.tmux_session_name for s in wt.sessions] == ["ext-claude", "ext-claude"]

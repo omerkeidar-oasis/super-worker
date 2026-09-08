@@ -163,7 +163,7 @@ class SessionSidebar(Vertical):
         for i, s in enumerate(worktree.sessions):
             state = states.get(s.tmux_session_name, SessionState.RUNNING)
             dot = self._state_dot(state)
-            tag = f"[dim]{get_session_type_tag(s.session_type)}[/]"
+            tag = f"[dim]{get_session_type_tag(s.session_type, foreign=s.foreign)}[/]"
             disp_label = s.label
             if label_counts[s.label] > 1:
                 idx = s.tmux_session_name.rsplit("-", 1)[-1]

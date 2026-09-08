@@ -14,7 +14,7 @@ from textual.widgets import Static, TabPane, TabbedContent
 
 from super_worker.config import ResolvedConfig, SWConfig, load_config, save_project_config
 from super_worker.constants import DEFAULT_WORKTREE_NAME
-from super_worker.models import AppState, Worktree
+from super_worker.models import AppState, Session, Worktree
 from super_worker.screens import (
     BranchExistsScreen,
     CommitMessageScreen,
@@ -42,6 +42,7 @@ from super_worker.services.tmux import (
     is_session_alive,
     kill_all_sessions,
     kill_session,
+    list_foreign_claude_sessions,
     open_external_terminal,
     read_all_state_files,
     read_state_file,
@@ -174,6 +175,7 @@ class ProjectView(Widget):
         self._active_worktree: Worktree | None = None
         self._active_session_name: str | None = None
         self._cached_session_states: dict[str, SessionState] = {}
+        self._refresh_tick = 0  # drives every-other-tick foreign-session scans
         # Only ensure the "main" worktree EXISTS in state (cheap, needed before
         # compose builds the tabs). Its tmux session is created lazily and
         # off the event loop by WorktreeTabContent.on_mount — creating it here
@@ -239,7 +241,14 @@ class ProjectView(Widget):
         TerminalPane hosts the watchers for all sessions across all worktrees,
         so attention indicators update instantly for the entire project.
         """
-        all_names = [s.tmux_session_name for wt in self._state.worktrees for s in wt.sessions]
+        # Foreign sessions have no sw state file (no hook), so there's nothing
+        # to kqueue-watch for them — exclude them from the watch list.
+        all_names = [
+            s.tmux_session_name
+            for wt in self._state.worktrees
+            for s in wt.sessions
+            if not s.foreign
+        ]
         if not all_names or not self._active_worktree:
             return
         try:
@@ -766,10 +775,16 @@ class ProjectView(Widget):
         - Dead session detection (lightweight alive check, no show_environment)
         - Syncing state cache from state files for sessions without kqueue watches
         """
-        # Merge anything created by another sw run (or a foreign session started
-        # outside sw) into the live state first, so the git/session passes below
-        # see the freshly-added worktrees/sessions in this same tick.
+        # Merge anything created by another sw run into the live state first, so
+        # the git/session passes below see the freshly-added worktrees/sessions
+        # in this same tick.
         await self._sync_from_disk()
+
+        # Foreign-session discovery is a few extra tmux calls — run it every
+        # OTHER tick to keep the common path light. (do_refresh runs it eagerly.)
+        self._refresh_tick += 1
+        if self._refresh_tick % 2 == 0:
+            await self._discover_foreign_sessions()
 
         all_session_names = [s.tmux_session_name for wt in self._state.worktrees for s in wt.sessions]
         if all_session_names:
@@ -901,13 +916,64 @@ class ProjectView(Widget):
             self._start_state_watching()
         return summary
 
+    async def _discover_foreign_sessions(self) -> int:
+        """Surface live non-sw tmux 'claude' sessions running in our worktree dirs.
+
+        These are DISPLAY-ONLY: shown in the sidebar tagged ``[ext]`` and
+        previewable, but never persisted, resumed, or killed by sw. Existing
+        foreign Session objects are REUSED across scans (so a stable one keeps
+        its id and doesn't churn the sidebar); any that vanished from tmux are
+        dropped, and newly-seen ones are appended. Returns the count added.
+        """
+        if not self._state.worktrees:
+            return 0
+        wt_paths = {wt.path for wt in self._state.worktrees}
+        # Never re-adopt sw's own sessions; foreign names are excluded from
+        # ``known`` so they CAN be re-discovered each scan.
+        known = {
+            s.tmux_session_name
+            for wt in self._state.worktrees
+            for s in wt.sessions
+            if not s.foreign
+        }
+        try:
+            found = await asyncio.to_thread(list_foreign_claude_sessions, wt_paths, known)
+        except Exception:
+            logger.debug("Foreign session discovery failed", exc_info=True)
+            return 0
+
+        added = 0
+        for wt in self._state.worktrees:
+            names = found.get(wt.path, [])
+            existing = {s.tmux_session_name: s for s in wt.sessions if s.foreign}
+            # Drop foreign sessions that are no longer live.
+            gone = [n for n in existing if n not in names]
+            if gone:
+                wt.sessions = [
+                    s for s in wt.sessions if not s.foreign or s.tmux_session_name in names
+                ]
+            # Append newly-seen foreign sessions (reuse existing objects).
+            present = {s.tmux_session_name for s in wt.sessions}
+            for name in names:
+                if name not in present:
+                    wt.sessions.append(Session(
+                        tmux_session_name=name,
+                        label=name,
+                        session_type="claude",
+                        foreign=True,
+                    ))
+                    present.add(name)
+                    added += 1
+        return added
+
     def do_refresh(self) -> None:
         """Manually run the live-sync now and notify the result (F5)."""
         async def _refresh() -> None:
             summary = await self._sync_from_disk()
+            foreign = await self._discover_foreign_sessions()
             # Repaint git/session state so newly-merged rows render immediately.
             await self._periodic_refresh_impl()
-            self.app.notify(self._refresh_summary(summary, foreign=0))
+            self.app.notify(self._refresh_summary(summary, foreign=foreign))
 
         self.run_worker(_refresh, exclusive=False)
 

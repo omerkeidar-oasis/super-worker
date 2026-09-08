@@ -39,8 +39,11 @@ FAST_SESSION_PREFIX = "sw-fast"
 FAST_STATUS_INTERVAL = 2  # seconds between tmux status bar refreshes
 
 
-def get_session_type_tag(session_type: str) -> str:
-    """Return short tag for a session type: 'sh' for terminal, 'CC' for claude."""
+def get_session_type_tag(session_type: str, foreign: bool = False) -> str:
+    """Return short tag for a session: 'ext' if foreign (adopted, non-sw),
+    else 'sh' for terminal, 'CC' for claude."""
+    if foreign:
+        return "ext"
     return "sh" if session_type == "terminal" else "CC"
 
 

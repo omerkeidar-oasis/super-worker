@@ -86,13 +86,34 @@ def _read_state_unlocked(config: ResolvedConfig) -> AppState:
     )
 
 
+def _serialize_state(state: AppState) -> str:
+    """Serialize state to JSON, EXCLUDING display-only foreign sessions.
+
+    Foreign (non-sw) sessions are re-discovered live on every scan; persisting
+    them would resurrect stale entries and let recovery/dedupe touch sessions
+    sw doesn't own. Filter into a plain-dict COPY so the live in-memory Session
+    objects are never mutated. The transient ``foreign`` flag is dropped from
+    the remaining sessions too, keeping the on-disk format unchanged.
+    """
+    data = state.model_dump()
+    for wt in data.get("worktrees", []):
+        kept = []
+        for s in wt.get("sessions", []):
+            if s.get("foreign", False):
+                continue
+            s.pop("foreign", None)
+            kept.append(s)
+        wt["sessions"] = kept
+    return json.dumps(data, indent=2)
+
+
 def _write_state_unlocked(state: AppState, config: ResolvedConfig) -> None:
     """Atomically write state (caller holds the lock)."""
     state_file = _state_file_for(config)
     if state_file.exists():
         shutil.copy2(state_file, state_file.with_suffix(".bak"))
     tmp = state_file.with_suffix(".tmp")
-    tmp.write_text(state.model_dump_json(indent=2))
+    tmp.write_text(_serialize_state(state))
     tmp.rename(state_file)
 
 
@@ -176,7 +197,11 @@ def recover_dead_sessions(state: AppState) -> bool:
         dead_claude = []
         dead_other = []
         for s in wt.sessions:
-            if is_session_alive(s.tmux_session_name):
+            if s.foreign:
+                # sw doesn't own foreign sessions — never respawn/recreate them.
+                # Preserve as-is (they're re-discovered on the next scan).
+                alive.append(s)
+            elif is_session_alive(s.tmux_session_name):
                 alive.append(s)
             elif s.session_type == "claude":
                 dead_claude.append(s)
@@ -266,6 +291,8 @@ def _ensure_remain_on_exit(state: AppState) -> None:
         return
     for wt in state.worktrees:
         for s in wt.sessions:
+            if s.foreign:
+                continue  # never mutate options on a session sw doesn't own
             tmux_sess = live.get(s.tmux_session_name)
             if tmux_sess is not None:
                 try:
@@ -309,6 +336,10 @@ def dedupe_session_names(state: AppState) -> bool:
     for wt in state.worktrees:
         scope = _worktree_scope(wt)
         for s in wt.sessions:
+            if s.foreign:
+                # Not sw's session — never rename it (its tmux name is real and
+                # owned elsewhere); it also can't be persisted or resumed.
+                continue
             if s.tmux_session_name not in seen:
                 seen.add(s.tmux_session_name)
                 continue

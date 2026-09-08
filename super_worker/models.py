@@ -19,6 +19,11 @@ class Session(BaseModel):
     # blunt `--continue`, which always reopens the single most-recent one.
     claude_session_id: str | None = None
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    # A live tmux session running claude in a worktree dir that sw did NOT
+    # create (discovered on scan). DISPLAY-ONLY: previewable, but never
+    # persisted, recovered, resumed, killed, or deduped by sw, and re-discovered
+    # each scan (so it drops when it goes away).
+    foreign: bool = False
 
 
 class Worktree(BaseModel):
