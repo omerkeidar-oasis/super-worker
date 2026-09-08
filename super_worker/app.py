@@ -70,6 +70,7 @@ class SuperWorkerApp(App):
         Binding("ctrl+shift+left", "prev_project", "Prev Project", key_display="ctrl+⇧◀"),
         Binding("ctrl+shift+right", "next_project", "Next Project", key_display="ctrl+⇧▶"),
         Binding("ctrl+e", "edit_settings", "Settings"),
+        Binding("f5", "refresh", "Refresh"),
         Binding("ctrl+q", "quit", "Quit"),
         Binding("f12", "debug_screenshot", "Screenshot", show=False),
     ]
@@ -441,6 +442,18 @@ class SuperWorkerApp(App):
     def action_edit_settings(self) -> None:
         if pv := self._active_project_view:
             pv.do_edit_settings()
+        else:
+            self.notify("Open a project first (Ctrl+O)", severity="warning")
+
+    def action_refresh(self) -> None:
+        """Manually re-sync worktrees/sessions from the shared state file (F5).
+
+        Runs the same merge the periodic timer does, immediately, and notifies
+        the result — so a worktree or session created by another sw run (or a
+        foreign session started outside sw) shows up without reopening.
+        """
+        if pv := self._active_project_view:
+            pv.do_refresh()
         else:
             self.notify("Open a project first (Ctrl+O)", severity="warning")
 

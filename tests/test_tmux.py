@@ -13,6 +13,7 @@ from super_worker.services.tmux import (
     is_session_alive,
     kill_session,
     kill_all_sessions,
+    list_foreign_claude_sessions,
     respawn_pane,
     send_keys,
     tmux_session_name,
@@ -25,6 +26,24 @@ from super_worker.services.tmux import (
 ])
 def test_tmux_session_name(name, index, expected):
     assert tmux_session_name(name, index) == expected
+
+
+def test_default_session_label_uses_unique_index():
+    """Default labels derive from the session's unique tmux index, not a count.
+
+    Regression: the old ``f"session {len(worktree.sessions)}"`` repeated after a
+    delete, producing two indistinguishable "session 1"s.
+    """
+    from super_worker.services.tmux import _default_session_label
+
+    assert _default_session_label("sw-main-7350d8-1") == "session 1"
+    assert _default_session_label("sw-main-7350d8-2") == "session 2"
+    # Worktree names may contain hyphens — only the trailing index matters.
+    assert _default_session_label("sw-aii-229-be7ab0-0") == "session 0"
+    # Distinct names never collide on the label.
+    assert _default_session_label("sw-x-1") != _default_session_label("sw-x-2")
+    # Non-numeric tail falls back gracefully rather than crashing.
+    assert _default_session_label("sw-weird") == "session"
 
 
 def _mock_server(monkeypatch, session=None, pane=None):
@@ -400,3 +419,67 @@ class TestBracketedPaste:
         monkeypatch.setattr("super_worker.services.tmux._get_server", lambda: server)
         paste_to_pane("sw-x-0", "")
         server.cmd.assert_not_called()
+
+
+class TestListForeignClaudeSessions:
+    """Discovery of non-sw 'claude' tmux sessions running in a worktree dir."""
+
+    def _sess(self, name, path, cmd):
+        s = MagicMock()
+        s.session_name = name
+        pane = MagicMock()
+        pane.pane_current_path = path
+        pane.pane_current_command = cmd
+        s.active_pane = pane
+        return s
+
+    def _mock(self, monkeypatch, sessions):
+        server = MagicMock()
+        server.sessions = sessions
+        monkeypatch.setattr("super_worker.services.tmux.libtmux.Server", lambda: server)
+
+    def test_adopts_foreign_claude_in_worktree_dir(self, monkeypatch, tmp_path):
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        self._mock(monkeypatch, [self._sess("cc-manual", str(wt), "claude")])
+        out = list_foreign_claude_sessions({str(wt)}, known_names=set())
+        assert out == {str(wt): ["cc-manual"]}
+
+    def test_skips_sw_own_sessions(self, monkeypatch, tmp_path):
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        self._mock(monkeypatch, [self._sess("sw-main-abc123-0", str(wt), "claude")])
+        assert list_foreign_claude_sessions({str(wt)}, set()) == {}
+
+    def test_skips_known_names(self, monkeypatch, tmp_path):
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        self._mock(monkeypatch, [self._sess("myclaude", str(wt), "claude")])
+        assert list_foreign_claude_sessions({str(wt)}, {"myclaude"}) == {}
+
+    def test_skips_non_claude_command(self, monkeypatch, tmp_path):
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        self._mock(monkeypatch, [self._sess("shell", str(wt), "bash")])
+        assert list_foreign_claude_sessions({str(wt)}, set()) == {}
+
+    def test_skips_session_in_unrelated_dir(self, monkeypatch, tmp_path):
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        other = tmp_path / "other"
+        other.mkdir()
+        self._mock(monkeypatch, [self._sess("cc", str(other), "claude")])
+        assert list_foreign_claude_sessions({str(wt)}, set()) == {}
+
+    def test_matches_via_realpath_through_symlink(self, monkeypatch, tmp_path):
+        real = tmp_path / "real"
+        real.mkdir()
+        link = tmp_path / "link"
+        link.symlink_to(real)
+        # Pane cwd is the symlink; worktree path is the real dir — realpath aligns.
+        self._mock(monkeypatch, [self._sess("cc", str(link), "claude")])
+        assert list_foreign_claude_sessions({str(real)}, set()) == {str(real): ["cc"]}
+
+    def test_empty_paths_returns_empty(self, monkeypatch):
+        self._mock(monkeypatch, [self._sess("cc", "/anywhere", "claude")])
+        assert list_foreign_claude_sessions(set(), set()) == {}

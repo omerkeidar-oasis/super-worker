@@ -5,6 +5,7 @@ Only the tmux server is mocked (external boundary) — all internal functions
 run for real against a redirected state directory.
 """
 
+import asyncio
 import shutil
 
 import git as gitpython
@@ -22,7 +23,8 @@ from super_worker.screens import (
     NewWorktreeScreen,
     RenameSessionScreen,
 )
-from super_worker.models import Worktree
+from super_worker.models import Session, Worktree
+from super_worker.services.state import load_state, save_state
 from super_worker.services.ui_state import UIState, load_ui_state, save_ui_state
 from super_worker.widgets.project_view import WorktreeTabContent
 from super_worker.widgets.sidebar import SessionDeleted, SidebarDivider
@@ -492,3 +494,246 @@ async def test_restore_skips_nonexistent_project():
         assert app.is_running
         open_paths = {str(c.repo_root) for c in app._open_configs}
         assert "/nonexistent/repo-xyz" not in open_paths
+# ── Live-sync from the shared state file (F5 / periodic) ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_f5_syncs_new_worktree_from_disk(tmp_path):
+    """A worktree written to the shared state file by another sw run shows up
+    on refresh, as a new tab, WITHOUT stealing the active tab."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        pv = _pv(app)
+        await pilot.pause(delay=0.5)  # let startup's own state save settle first
+        active_before = pv._active_worktree.name if pv._active_worktree else None
+
+        # Simulate another sw process adding a worktree to the shared file.
+        other_dir = tmp_path / "other-wt"
+        other_dir.mkdir()
+        disk = load_state(pv._config)
+        disk.worktrees.append(Worktree(name="fromdisk", path=str(other_dir), branch="sw-fromdisk"))
+        save_state(disk, pv._config)
+
+        await pilot.press("f5")
+        await pilot.pause(delay=1.0)
+
+        assert pv._state.get_worktree("fromdisk") is not None
+        assert list(pv.query("#wt-fromdisk")), "a tab should have been added"
+        # Focus/active tab must NOT have been hijacked by the discovery.
+        assert (pv._active_worktree.name if pv._active_worktree else None) == active_before
+
+
+@pytest.mark.asyncio
+async def test_refresh_syncs_new_session_into_existing_worktree():
+    """A session added to an existing worktree's file entry appears in its sidebar."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        pv = _pv(app)
+        await pilot.pause(delay=0.5)  # let startup's own state save settle first
+        main = pv._state.worktrees[0]
+        before = {s.tmux_session_name for s in main.sessions}
+
+        disk = load_state(pv._config)
+        disk_main = disk.get_worktree(main.name)
+        injected = Session(tmux_session_name="sw-main-injected-9", label="external-run")
+        disk_main.sessions.append(injected)
+        save_state(disk, pv._config)
+
+        pv.do_refresh()
+        await pilot.pause(delay=1.0)
+
+        names = {s.tmux_session_name for s in main.sessions}
+        assert "sw-main-injected-9" in names
+        assert names > before
+
+
+@pytest.mark.asyncio
+async def test_refresh_drops_worktree_whose_path_is_gone():
+    """A worktree tracked in memory but absent from the file AND whose path no
+    longer exists is dropped on refresh."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        pv = _pv(app)
+        ghost = Worktree(name="ghost", path="/nonexistent/ghost-wt", branch="sw-ghost")
+        pv._state.worktrees.append(ghost)
+        await pv._add_worktree_tab(ghost, activate=False)
+        await pilot.pause(delay=0.5)
+        assert list(pv.query("#wt-ghost")), "tab exists before refresh"
+
+        # Adding the tab persisted ghost to disk; simulate another process
+        # having removed it from the shared file (its dir is already gone).
+        disk = load_state(pv._config)
+        disk.worktrees = [w for w in disk.worktrees if w.name != "ghost"]
+        save_state(disk, pv._config)
+
+        pv.do_refresh()
+        await pilot.pause(delay=1.0)
+
+        assert pv._state.get_worktree("ghost") is None
+        assert not list(pv.query("#wt-ghost")), "gone worktree's tab was dropped"
+
+
+@pytest.mark.asyncio
+async def test_refresh_keeps_unpersisted_local_session():
+    """Refresh must NOT drop an in-memory session that isn't in the file yet
+    (it may just not be persisted — dropping it would race the write)."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        pv = _pv(app)
+        main = pv._state.worktrees[0]
+        local = Session(tmux_session_name="sw-main-local-77", label="not-yet-saved")
+        main.sessions.append(local)
+
+        pv.do_refresh()
+        await pilot.pause(delay=1.0)
+
+        names = {s.tmux_session_name for s in main.sessions}
+        assert "sw-main-local-77" in names
+
+
+# ── Adopting foreign (non-sw) tmux sessions ───────────────────────────────────
+
+
+def _inject_foreign_session(worktree_path: str, name: str = "cc-manual"):
+    """Append a mock non-sw 'claude' tmux session in ``worktree_path`` to the
+    shared mock server and return it."""
+    import super_worker.services.tmux as tmux_mod
+    server = tmux_mod._get_server()
+    foreign = MagicMock()
+    foreign.session_name = name
+    pane = MagicMock()
+    pane.pane_current_path = worktree_path
+    pane.pane_current_command = "claude"
+    foreign.active_pane = pane
+    foreign.show_environment.return_value = {}
+    server.sessions.append(foreign)
+    return server, foreign
+
+
+@pytest.mark.asyncio
+async def test_foreign_session_surfaced_tagged_and_not_persisted():
+    """A non-sw claude session in a worktree dir is surfaced, tagged [ext],
+    not double-counted on re-scan, and never written to the state file."""
+    from rich.text import Text
+    from super_worker.widgets.sidebar import SessionSidebar
+    from textual.widgets import Label, ListView
+
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        pv = _pv(app)
+        await pilot.pause(delay=0.5)
+        main = pv._state.worktrees[0]
+        _inject_foreign_session(str(main.path))
+
+        pv.do_refresh()
+        await pilot.pause(delay=1.0)
+
+        foreign = [s for s in main.sessions if s.foreign]
+        assert len(foreign) == 1
+        assert foreign[0].tmux_session_name == "cc-manual"
+
+        # Re-scan must not double-count (existing foreign object is reused).
+        pv.do_refresh()
+        await pilot.pause(delay=1.0)
+        assert len([s for s in main.sessions if s.foreign]) == 1
+
+        # Sidebar renders it with the [ext] tag.
+        wtc = pv.query_one(f"#wtc-{main.name}", WorktreeTabContent)
+        sidebar = wtc.query_one(SessionSidebar)
+        labels = []
+        for lbl in sidebar.query_one("#session-list", ListView).query(Label):
+            r = lbl.render()
+            labels.append(r.plain if hasattr(r, "plain") else Text.from_markup(str(r)).plain)
+        assert any("ext" in text for text in labels), labels
+
+        # Foreign sessions are DISPLAY-ONLY — never persisted to the state file.
+        disk = load_state(pv._config)
+        disk_names = {s.tmux_session_name for w in disk.worktrees for s in w.sessions}
+        assert "cc-manual" not in disk_names
+
+
+@pytest.mark.asyncio
+async def test_foreign_session_dropped_when_gone():
+    """A foreign session is re-discovered each scan and dropped once it's gone."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        pv = _pv(app)
+        await pilot.pause(delay=0.5)
+        main = pv._state.worktrees[0]
+        server, foreign = _inject_foreign_session(str(main.path))
+
+        pv.do_refresh()
+        await pilot.pause(delay=1.0)
+        assert any(s.foreign for s in main.sessions)
+
+        # The foreign tmux session ends — next scan must drop it.
+        server.sessions.remove(foreign)
+        pv.do_refresh()
+        await pilot.pause(delay=1.0)
+        assert not any(s.foreign for s in main.sessions)
+
+
+# ── Orphan sw-session adoption (repairs the clobber, prevents empty-on-open) ───
+
+
+@pytest.mark.asyncio
+async def test_sessionless_worktree_adopts_live_sw_session_not_empty():
+    """A worktree that's sessionless in state but has a LIVE sw session adopts it
+    on open (as a real, foreign=False session) instead of spawning an empty one."""
+    import super_worker.services.tmux as tmux_mod
+    from super_worker.services.tmux import _worktree_scope, tmux_session_name
+
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        pv = _pv(app)
+        await pilot.pause(delay=0.5)
+
+        wt = Worktree(name="adopt", path=str(pv._config.repo_root), branch="sw-adopt")
+        live_name = tmux_session_name("adopt", 0, _worktree_scope(wt))
+        server = tmux_mod._get_server()
+        live = MagicMock()
+        live.session_name = live_name
+        live.active_pane = MagicMock()
+        live.show_environment.return_value = {}
+        server.sessions.append(live)
+
+        pv._state.worktrees.append(wt)
+        await pv._add_worktree_tab(wt, activate=False)
+        await pilot.pause(delay=1.0)
+
+        # Adopted the live sw session; did NOT create a redundant empty one.
+        assert len(wt.sessions) == 1
+        assert wt.sessions[0].tmux_session_name == live_name
+        assert wt.sessions[0].foreign is False
+
+
+@pytest.mark.asyncio
+async def test_tui_persist_preserves_concurrently_added_session():
+    """End-to-end clobber regression: a session another process added to the
+    shared file survives a subsequent TUI write (merge, not overwrite)."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        pv = _pv(app)
+        await pilot.pause(delay=0.5)
+        main = pv._state.worktrees[0]
+
+        # Another process appends session S to main in the shared file; the TUI's
+        # in-memory state does NOT know about S.
+        disk = load_state(pv._config)
+        disk.get_worktree(main.name).sessions.append(
+            Session(tmux_session_name="sw-main-concurrent-0", label="S")
+        )
+        save_state(disk, pv._config)
+        assert all(s.tmux_session_name != "sw-main-concurrent-0" for s in main.sessions)
+
+        # The TUI now persists a change of its own (rename its existing session).
+        renamed = main.sessions[0]
+        from super_worker.services.state import update_session_label_in_state_file
+        await asyncio.to_thread(
+            update_session_label_in_state_file, pv._config, main.name, renamed.id, "renamed-by-tui"
+        )
+
+        after = load_state(pv._config).get_worktree(main.name)
+        names = {s.tmux_session_name for s in after.sessions}
+        assert "sw-main-concurrent-0" in names, "concurrent session S must not be clobbered"
+        assert any(s.id == renamed.id and s.label == "renamed-by-tui" for s in after.sessions)
