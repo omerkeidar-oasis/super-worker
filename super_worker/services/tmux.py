@@ -180,6 +180,74 @@ def batch_check_alive(session_names: list[str]) -> set[str]:
     return dead
 
 
+def list_foreign_claude_sessions(
+    worktree_paths: set[str], known_names: set[str]
+) -> dict[str, list[str]]:
+    """Find live tmux 'claude' sessions running in a worktree dir that sw did NOT create.
+
+    A tmux session is foreign-adoptable for worktree path ``P`` when ALL hold:
+      (a) its active pane's ``pane_current_path`` (resolved via
+          ``os.path.realpath``) equals ``os.path.realpath(P)``;
+      (b) its name is NOT in ``known_names`` and does NOT start with the sw
+          prefix — so sw's OWN sessions are never adopted;
+      (c) it looks like claude — its active pane's ``pane_current_command``
+          contains "claude" (case-insensitive).
+
+    (c) is deliberately conservative: it confirms via tmux's own foreground
+    command rather than a heavier ``ps`` on the pane's process tree. The
+    trade-off is that a claude install whose foreground process reports as
+    ``node`` won't be adopted — accepted, because it produces NO false
+    positives (a plain shell or unrelated program in a worktree dir is never
+    surfaced).
+
+    Returns ``{worktree_path: [session_name, ...]}``. READ-ONLY: it only lists
+    sessions and reads pane attributes; it never creates, kills, resizes, or
+    otherwise touches any session.
+    """
+    if not worktree_paths:
+        return {}
+    # Map realpath -> the original worktree path string used as the dict key.
+    targets: dict[str, str] = {}
+    for p in worktree_paths:
+        try:
+            targets[os.path.realpath(p)] = p
+        except OSError:
+            continue
+    if not targets:
+        return {}
+
+    server = _get_server()
+    try:
+        sessions = list(server.sessions)
+    except Exception:
+        logger.debug("Failed to list tmux sessions for foreign discovery", exc_info=True)
+        return {}
+
+    found: dict[str, list[str]] = {}
+    for sess in sessions:
+        name = getattr(sess, "session_name", None)
+        if not name or name in known_names or name.startswith(TMUX_SESSION_PREFIX):
+            continue
+        try:
+            pane = sess.active_pane
+            if pane is None:
+                continue
+            cur_path = getattr(pane, "pane_current_path", None)
+            cur_cmd = getattr(pane, "pane_current_command", None) or ""
+        except Exception:
+            continue
+        if not cur_path or "claude" not in cur_cmd.lower():
+            continue
+        try:
+            real = os.path.realpath(cur_path)
+        except OSError:
+            continue
+        wt_path = targets.get(real)
+        if wt_path is not None:
+            found.setdefault(wt_path, []).append(name)
+    return found
+
+
 def cleanup_state_file(session_name: str) -> None:
     """Remove the state file for a session (called on session deletion)."""
     from super_worker.constants import SESSION_STATES_DIR
@@ -669,8 +737,14 @@ def kill_session(tmux_session_name: str) -> None:
 
 
 def kill_all_sessions(worktree: Worktree) -> None:
-    """Kill all tmux sessions for a worktree."""
+    """Kill all sw tmux sessions for a worktree.
+
+    Foreign (adopted, non-sw) sessions are display-only — sw never kills them,
+    even when their worktree is deleted.
+    """
     for session in worktree.sessions:
+        if getattr(session, "foreign", False):
+            continue
         kill_session(session.tmux_session_name)
 
 

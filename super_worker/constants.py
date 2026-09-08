@@ -22,7 +22,7 @@ DEFAULT_WORKTREE_NAME = "main"
 # NOT reserved: Shift+Tab (Claude Code permission-mode cycling) and Ctrl+R
 # (Claude Code's transcript view — the only way to browse a CC session's
 # full history, since CC never writes terminal scrollback). Rename is F2.
-RESERVED_KEYS = {"ctrl+n", "ctrl+s", "ctrl+a", "ctrl+t", "f2", "ctrl+d", "ctrl+e", "ctrl+q", "ctrl+o", "ctrl+shift+left", "ctrl+shift+right", "f12", "tab"}
+RESERVED_KEYS = {"ctrl+n", "ctrl+s", "ctrl+a", "ctrl+t", "f2", "ctrl+d", "ctrl+e", "ctrl+q", "ctrl+o", "ctrl+shift+left", "ctrl+shift+right", "f5", "f12", "tab"}
 
 _WORKTREE_NAME_RE = re.compile(r"[a-zA-Z0-9_-]+")
 
@@ -39,8 +39,11 @@ FAST_SESSION_PREFIX = "sw-fast"
 FAST_STATUS_INTERVAL = 2  # seconds between tmux status bar refreshes
 
 
-def get_session_type_tag(session_type: str) -> str:
-    """Return short tag for a session type: 'sh' for terminal, 'CC' for claude."""
+def get_session_type_tag(session_type: str, foreign: bool = False) -> str:
+    """Return short tag for a session: 'ext' if foreign (adopted, non-sw),
+    else 'sh' for terminal, 'CC' for claude."""
+    if foreign:
+        return "ext"
     return "sh" if session_type == "terminal" else "CC"
 
 
