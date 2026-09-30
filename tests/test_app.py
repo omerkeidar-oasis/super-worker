@@ -26,8 +26,9 @@ from super_worker.screens import (
 from super_worker.models import Session, Worktree
 from super_worker.services.state import load_state, save_state
 from super_worker.services.ui_state import UIState, load_ui_state, save_ui_state
+from super_worker.widgets.project_drawer import ProjectRemoved
 from super_worker.widgets.project_view import WorktreeTabContent
-from super_worker.widgets.sidebar import SessionDeleted, SidebarDivider
+from super_worker.widgets.sidebar import SessionDeleted, SessionSidebar, SidebarDivider
 from super_worker.widgets.terminal_pane import TerminalPane
 
 
@@ -737,3 +738,93 @@ async def test_tui_persist_preserves_concurrently_added_session():
         names = {s.tmux_session_name for s in after.sessions}
         assert "sw-main-concurrent-0" in names, "concurrent session S must not be clobbered"
         assert any(s.id == renamed.id and s.label == "renamed-by-tui" for s in after.sessions)
+
+
+# ── Non-git projects ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_non_git_project_opens_with_git_hidden(tmp_path, monkeypatch):
+    """A non-git folder opens as a project: one 'main' worktree (branch ''),
+    the Git sidebar section hidden, and working sessions."""
+    # Force every gitpython.Repo open to fail so the launch dir is treated as
+    # a plain (non-git) folder — hermetic regardless of where tests run.
+    monkeypatch.setattr(
+        gitpython, "Repo",
+        MagicMock(side_effect=gitpython.InvalidGitRepositoryError("not a repo")),
+    )
+    folder = tmp_path / "plain-project"
+    folder.mkdir()
+    monkeypatch.chdir(folder)
+
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        pv = _pv(app)
+        assert pv is not None
+        assert pv._config.is_git is False
+        assert len(pv._state.worktrees) == 1
+        wt = pv._state.worktrees[0]
+        assert wt.name == "main"
+        assert wt.branch == ""
+
+        await pilot.pause(delay=1.0)  # let the tab wire up + spawn its session
+
+        wtc = pv.query_one(f"#wtc-{wt.name}", WorktreeTabContent)
+        sidebar = wtc.query_one(SessionSidebar)
+        # Git section is hidden — the #git-status widget doesn't exist at all.
+        assert sidebar._show_git is False
+        assert len(sidebar.query("#git-status")) == 0
+        # Sessions still work — one was created for the implicit worktree.
+        assert len(wt.sessions) >= 1
+
+        # New Worktree is disabled: Ctrl+N does not open the modal.
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+        assert not isinstance(app.screen, NewWorktreeScreen)
+
+
+@pytest.mark.asyncio
+async def test_remove_non_git_project_keeps_folder(tmp_path, monkeypatch):
+    """Removing a non-git project forgets it but never deletes the folder."""
+    monkeypatch.setattr(
+        gitpython, "Repo",
+        MagicMock(side_effect=gitpython.InvalidGitRepositoryError("not a repo")),
+    )
+    folder = tmp_path / "keep-me"
+    folder.mkdir()
+    (folder / "important.txt").write_text("precious data")
+    monkeypatch.chdir(folder)
+
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        pv = _pv(app)
+        assert pv._config.is_git is False
+        path = str(pv._config.repo_root)
+        await pilot.pause(delay=0.5)
+
+        app.post_message(ProjectRemoved(path))
+        await pilot.pause(delay=0.5)
+
+        # The folder and its contents survive — only the registry/state forget it.
+        assert folder.exists()
+        assert (folder / "important.txt").read_text() == "precious data"
+        assert path not in [str(c.repo_root) for c in app._open_configs]
+
+
+@pytest.mark.asyncio
+async def test_git_project_keeps_git_section():
+    """Regression: a git project keeps is_git True and its Git sidebar section."""
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        pv = _pv(app)
+        assert pv._config.is_git is True
+        await pilot.pause(delay=1.0)
+        wt = pv._state.worktrees[0]
+        wtc = pv.query_one(f"#wtc-{wt.name}", WorktreeTabContent)
+        sidebar = wtc.query_one(SessionSidebar)
+        assert sidebar._show_git is True
+        assert len(sidebar.query("#git-status")) == 1
+        # New Worktree is allowed for a git project (Ctrl+N opens the modal).
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+        assert isinstance(app.screen, NewWorktreeScreen)

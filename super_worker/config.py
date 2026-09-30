@@ -49,6 +49,10 @@ class ResolvedConfig(BaseModel):
     """Flat config with all values guaranteed filled."""
 
     repo_root: Path
+    # False when repo_root is a plain (non-git) folder opened as a project. All
+    # git features are disabled for such projects: no worktree creation, no
+    # branch/status polling, no git-remove. See load_config for the fallback.
+    is_git: bool = True
     worktree_prefix: str
     branch_prefix: str
     base_dir: Path
@@ -198,7 +202,21 @@ def load_config(repo_path: Path | str | None = None) -> ResolvedConfig:
         repo_path: Optional path to a git repo. If None, auto-detects from CWD.
     """
     cwd = Path(repo_path) if repo_path else None
-    repo_root = detect_repo_root(cwd)
+    # Detect git-ness. A plain (non-git) folder opens as a first-class project
+    # with all git features disabled — detect_repo_root itself keeps raising for
+    # the CLI callers that truly require git (see cli._require_git_repo).
+    try:
+        repo_root = detect_repo_root(cwd)
+        is_git = True
+    except (RuntimeError, gitpython.NoSuchPathError, gitpython.InvalidGitRepositoryError):
+        base = Path(repo_path) if repo_path else Path.cwd()
+        if not base.exists():
+            # A path the user typed that doesn't exist — surface it as an error
+            # rather than materializing a phantom non-git project.
+            raise RuntimeError(f"Path does not exist: {base}")
+        repo_root = base.resolve()
+        is_git = False
+
     global_config_path = Path.home() / ".config" / "sw" / "config.toml"
     project_config_path = repo_root / ".sw.toml"
 
@@ -206,13 +224,21 @@ def load_config(repo_path: Path | str | None = None) -> ResolvedConfig:
     project_cfg = load_toml(project_config_path)
     merged = _merge_configs(project_cfg, global_cfg)
 
-    remote = merged.git.remote or detect_remote(repo_root)
-    main_branch = merged.git.main_branch or detect_main_branch(remote, repo_root)
     repo_name = repo_root.name
     branch_prefix = merged.worktree.branch_prefix or "sw-"
 
+    if is_git:
+        remote = merged.git.remote or detect_remote(repo_root)
+        main_branch = merged.git.main_branch or detect_main_branch(remote, repo_root)
+    else:
+        # No git → no remote/main branch. worktree_prefix falls back to the
+        # folder name, base_dir to its parent (both unused for non-git).
+        remote = ""
+        main_branch = ""
+
     return ResolvedConfig(
         repo_root=repo_root,
+        is_git=is_git,
         worktree_prefix=merged.worktree.prefix or repo_name,
         branch_prefix=branch_prefix,
         # Anchor a relative base_dir to the repo root — resolving against the

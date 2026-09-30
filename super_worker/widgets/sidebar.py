@@ -85,7 +85,7 @@ class SessionSidebar(Vertical):
         Binding("x", "delete_session", "Delete Session", show=True),
     ]
 
-    def __init__(self, remote: str = "origin", main_branch: str = "main") -> None:
+    def __init__(self, remote: str = "origin", main_branch: str = "main", show_git: bool = True) -> None:
         super().__init__()
         self._worktree: Worktree | None = None
         self._session_map: dict[int, Session] = {}
@@ -93,13 +93,16 @@ class SessionSidebar(Vertical):
         self._prev_git_snapshot: str = ""
         self._remote = remote
         self._main_branch = main_branch
+        # Non-git projects hide the Git section entirely (no #git-status widget).
+        self._show_git = show_git
 
     def compose(self) -> ComposeResult:
         yield Static("Sessions", classes="sidebar-section")
         yield Static("", id="sidebar-info")
         yield ListView(id="session-list")
-        yield Static("Git", classes="sidebar-section")
-        yield Static("", id="git-status")
+        if self._show_git:
+            yield Static("Git", classes="sidebar-section")
+            yield Static("", id="git-status")
         yield Static("x: delete session", id="sidebar-hint")
 
     @staticmethod
@@ -194,6 +197,8 @@ class SessionSidebar(Vertical):
             self._refresh_git_status(worktree, status=git_status, dirty=git_dirty)
 
     def _refresh_git_status(self, worktree: Worktree, status: dict | None = None, dirty: bool | None = None) -> None:
+        if not self._show_git:
+            return  # non-git project — no Git section / #git-status widget exists
         if status is None:
             status = get_branch_status(worktree.path, self._remote, self._main_branch)
         if dirty is None:

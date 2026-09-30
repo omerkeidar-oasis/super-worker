@@ -108,14 +108,18 @@ class WorktreeTabContent(Horizontal):
     }
     """
 
-    def __init__(self, worktree: Worktree, remote: str = "origin", main_branch: str = "main") -> None:
+    def __init__(
+        self, worktree: Worktree, remote: str = "origin",
+        main_branch: str = "main", is_git: bool = True,
+    ) -> None:
         super().__init__(id=f"wtc-{worktree.name}")
         self.worktree = worktree
         self._remote = remote
         self._main_branch = main_branch
+        self._is_git = is_git
 
     def compose(self) -> ComposeResult:
-        yield SessionSidebar(remote=self._remote, main_branch=self._main_branch)
+        yield SessionSidebar(remote=self._remote, main_branch=self._main_branch, show_git=self._is_git)
         yield SidebarDivider()
         yield TerminalPane()
 
@@ -135,8 +139,13 @@ class WorktreeTabContent(Horizontal):
 
             session_names = [s.tmux_session_name for s in self.worktree.sessions]
             states = await asyncio.to_thread(batch_detect_session_states, session_names) if session_names else {}
-            status = await asyncio.to_thread(get_branch_status, self.worktree.path, self._remote, self._main_branch)
-            dirty = await asyncio.to_thread(get_worktree_dirty, self.worktree.path)
+            # Skip git subprocesses for non-git projects; the sidebar has no
+            # Git section, so status/dirty go unused (passed as None).
+            if self._is_git:
+                status = await asyncio.to_thread(get_branch_status, self.worktree.path, self._remote, self._main_branch)
+                dirty = await asyncio.to_thread(get_worktree_dirty, self.worktree.path)
+            else:
+                status, dirty = None, None
             sidebar = self.query_one(SessionSidebar)
             sidebar.show_worktree(self.worktree, states=states, git_status=status, git_dirty=dirty)
 
@@ -246,7 +255,7 @@ class ProjectView(Widget):
             with TabbedContent(id="tabs", initial=initial):
                 for wt in self._state.worktrees:
                     with TabPane(self._tab_label(wt), id=f"wt-{wt.name}"):
-                        yield WorktreeTabContent(wt, self._config.remote, self._config.main_branch)
+                        yield WorktreeTabContent(wt, self._config.remote, self._config.main_branch, self._config.is_git)
         else:
             yield Static("No worktrees. Press Ctrl+N to create one.", id="empty-state")
 
@@ -562,6 +571,10 @@ class ProjectView(Widget):
     # ── Public delegation API ─────────────────────────────────────────────────
 
     def do_new_worktree(self) -> None:
+        if not self._config.is_git:
+            self.app.notify("Not a git project — no worktrees", severity="warning")
+            return
+
         def handle_result(result: tuple[str, str | None, str | None, bool, bool, bool] | None) -> None:
             if result is None:
                 return
@@ -632,7 +645,7 @@ class ProjectView(Widget):
             tabs = self.query_one("#tabs", TabbedContent)
 
         pane = TabPane(self._tab_label(wt), id=f"wt-{wt.name}")
-        pane.compose_add_child(WorktreeTabContent(wt, self._config.remote, self._config.main_branch))
+        pane.compose_add_child(WorktreeTabContent(wt, self._config.remote, self._config.main_branch, self._config.is_git))
         await tabs.add_pane(pane)
         if activate:
             tabs.active = f"wt-{wt.name}"
@@ -772,6 +785,12 @@ class ProjectView(Widget):
             self.app.notify("No worktree selected", severity="warning")
             return
         wt = self._active_worktree
+        # Non-git projects have no worktrees to remove, and their single "main"
+        # worktree IS the user's folder — never let removal reach the git-remove
+        # / rmtree path in worktree.remove_worktree.
+        if not self._config.is_git:
+            self.app.notify("Not a git project — no worktrees", severity="warning")
+            return
         if wt.name == DEFAULT_WORKTREE_NAME:
             self.app.notify("Cannot delete the main worktree", severity="warning")
             return
@@ -927,7 +946,9 @@ class ProjectView(Widget):
                 ))
 
         git_data: dict[str, tuple[dict, bool]] = {}
-        if self._state.worktrees:
+        # Non-git projects have no branch/status — skip the git subprocesses
+        # entirely (tab labels + sidebar simply carry no git data).
+        if self._config.is_git and self._state.worktrees:
             tasks = []
             for wt in self._state.worktrees:
                 tasks.append(asyncio.to_thread(get_branch_status, wt.path, self._config.remote, self._config.main_branch))
@@ -1123,11 +1144,19 @@ class ProjectView(Widget):
 
     async def _refresh_sidebar(self, wt: Worktree) -> None:
         session_names = [s.tmux_session_name for s in wt.sessions]
-        states, status, dirty = await asyncio.gather(
-            asyncio.to_thread(batch_detect_session_states, session_names) if session_names else asyncio.sleep(0, result={}),
-            asyncio.to_thread(get_branch_status, wt.path, self._config.remote, self._config.main_branch),
-            asyncio.to_thread(get_worktree_dirty, wt.path),
+        states_task = (
+            asyncio.to_thread(batch_detect_session_states, session_names)
+            if session_names else asyncio.sleep(0, result={})
         )
+        if self._config.is_git:
+            states, status, dirty = await asyncio.gather(
+                states_task,
+                asyncio.to_thread(get_branch_status, wt.path, self._config.remote, self._config.main_branch),
+                asyncio.to_thread(get_worktree_dirty, wt.path),
+            )
+        else:
+            states = await states_task
+            status, dirty = None, None
         try:
             wtc = self.query_one(f"#wtc-{wt.name}", WorktreeTabContent)
             wtc.query_one(SessionSidebar).show_worktree(wt, states=states, git_status=status, git_dirty=dirty)

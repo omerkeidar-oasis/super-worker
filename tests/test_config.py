@@ -302,3 +302,62 @@ class TestLoadConfig:
         cfg = load_config(str(repo_root))
         assert cfg.worktree_prefix == "custom"
         assert cfg.main_branch == "develop"
+
+    def test_git_repo_sets_is_git_true(self, tmp_path, monkeypatch):
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        mock_repo = MagicMock()
+        mock_repo.working_dir = str(repo_root)
+        origin = MagicMock()
+        origin.name = "origin"
+        mock_repo.remotes = [origin]
+        mock_repo.git.symbolic_ref.return_value = "refs/remotes/origin/main"
+        mock_repo.git.rev_parse.return_value = ".git"
+        monkeypatch.setattr(gitpython, "Repo", lambda *a, **kw: mock_repo)
+        cfg = load_config(str(repo_root))
+        assert cfg.is_git is True
+
+
+class TestLoadConfigNonGit:
+    def test_non_git_dir_does_not_raise_and_is_git_false(self, tmp_path, monkeypatch):
+        """A plain folder loads as a non-git project with sensible defaults."""
+        folder = tmp_path / "plain-project"
+        folder.mkdir()
+        # Simulate a non-git directory: gitpython can't open a repo here.
+        monkeypatch.setattr(
+            gitpython, "Repo",
+            MagicMock(side_effect=gitpython.InvalidGitRepositoryError("not a repo")),
+        )
+        cfg = load_config(str(folder))
+        assert cfg.is_git is False
+        assert cfg.repo_root == folder.resolve()
+        assert cfg.remote == ""
+        assert cfg.main_branch == ""
+        # worktree_prefix falls back to the folder name; base_dir to its parent.
+        assert cfg.worktree_prefix == folder.name
+        assert cfg.base_dir == folder.parent
+        # state_hash (a path hash) still works for any folder.
+        assert len(cfg.state_hash) == 12
+
+    def test_non_git_defaults_to_cwd_when_no_path(self, tmp_path, monkeypatch):
+        """`sw` launched from a non-git dir opens that CWD as a non-git project."""
+        folder = tmp_path / "cwd-project"
+        folder.mkdir()
+        monkeypatch.setattr(
+            gitpython, "Repo",
+            MagicMock(side_effect=gitpython.InvalidGitRepositoryError("not a repo")),
+        )
+        monkeypatch.chdir(folder)
+        cfg = load_config()
+        assert cfg.is_git is False
+        assert cfg.repo_root == folder.resolve()
+
+    def test_missing_path_still_raises(self, tmp_path, monkeypatch):
+        """A path the user typed that doesn't exist is an error, not a phantom project."""
+        monkeypatch.setattr(
+            gitpython, "Repo",
+            MagicMock(side_effect=gitpython.InvalidGitRepositoryError("not a repo")),
+        )
+        missing = tmp_path / "does-not-exist"
+        with pytest.raises(RuntimeError, match="does not exist"):
+            load_config(str(missing))
