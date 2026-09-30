@@ -4,11 +4,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from super_worker.config import ResolvedConfig
 from super_worker.models import AppState, Session, Worktree
 from super_worker.services.state import (
     _migrate_data,
     _state_file_for,
     add_sessions_to_state_file,
+    ensure_default_worktree,
     add_worktree_to_state_file,
     adopt_orphan_sw_sessions,
     load_projects_registry,
@@ -135,6 +137,82 @@ class TestReconcileState:
         monkeypatch.setattr("super_worker.services.state.prune_git_cache", lambda paths: None)
         assert reconcile_state(state) is False
         assert len(state.worktrees) == 2
+
+
+def _non_git_config(folder: Path) -> ResolvedConfig:
+    """A ResolvedConfig for a plain (non-git) folder opened as a project."""
+    return ResolvedConfig(
+        repo_root=folder,
+        is_git=False,
+        worktree_prefix=folder.name,
+        branch_prefix="sw-",
+        base_dir=folder.parent,
+        symlinks=[],
+        copies=[],
+        post_create_hook="",
+        main_branch="",
+        remote="",
+        commit_placeholder="",
+        name_placeholder="",
+        branch_placeholder="",
+    )
+
+
+class TestNonGitProject:
+    def test_ensure_default_worktree_empty_branch_no_git_call(self, tmp_path, monkeypatch):
+        """Non-git 'main' worktree points at the folder with an empty branch,
+        and the git branch helper is never called."""
+        import super_worker.services.state as state_mod
+
+        monkeypatch.setattr(
+            state_mod, "get_current_branch",
+            MagicMock(side_effect=AssertionError("git branch queried for non-git project")),
+        )
+        folder = tmp_path / "plain"
+        folder.mkdir()
+        cfg = _non_git_config(folder)
+        state = AppState(repo_root=str(folder), worktree_base=str(folder.parent))
+
+        created = ensure_default_worktree(state, cfg)
+        assert created is True
+        wt = state.get_worktree("main")
+        assert wt is not None
+        assert wt.branch == ""
+        assert wt.path == str(folder)
+
+    def test_reconcile_skips_git_discovery_for_non_git(self, tmp_path, monkeypatch):
+        """reconcile_state never runs git worktree discovery for a non-git project."""
+        import super_worker.services.state as state_mod
+
+        monkeypatch.setattr(
+            state_mod, "discover_worktrees",
+            MagicMock(side_effect=AssertionError("git discovery run for non-git project")),
+        )
+        monkeypatch.setattr(state_mod, "prune_git_cache", lambda paths: None)
+        folder = tmp_path / "plain"
+        folder.mkdir()
+        cfg = _non_git_config(folder)
+        state = AppState(
+            repo_root=str(folder),
+            worktree_base=str(folder.parent),
+            worktrees=[Worktree(name="main", path=str(folder), branch="")],
+        )
+        # Must not raise (discovery is skipped) and keeps the one worktree.
+        reconcile_state(state, cfg)
+        assert [w.name for w in state.worktrees] == ["main"]
+
+    @pytest.mark.usefixtures("_redirect_state_dir")
+    def test_registry_keeps_non_git_folder(self, tmp_path):
+        """Normalizing the registry keeps a non-git folder rather than dropping it."""
+        folder = tmp_path / "plain"
+        folder.mkdir()
+        cfg = _non_git_config(folder)
+        update_projects_registry(cfg)
+        # A second update triggers normalization over the whole list — the
+        # non-git folder must survive (a git-only drop would forget it).
+        update_projects_registry(cfg)
+        projects = load_projects_registry()
+        assert str(folder.resolve()) in projects
 
 
 class TestProjectsRegistry:

@@ -95,12 +95,15 @@ class SuperWorkerApp(App):
             SidebarDivider._shared_width = self._ui_state.sidebar_width
 
         try:
+            # load_config opens a non-git launch dir as a non-git project
+            # (is_git=False) rather than raising — so `sw` from any folder just
+            # works. RuntimeError now only fires for an unreadable/missing cwd.
             config = load_config()
             state = load_and_reconcile(config)
             self._initial_project = (config, state)
             self._open_configs.append(config)
         except RuntimeError:
-            pass  # Started outside a git repo; drawer will prompt
+            pass  # Couldn't resolve a launch dir; drawer will prompt
 
     def compose(self) -> ComposeResult:
         yield Header()

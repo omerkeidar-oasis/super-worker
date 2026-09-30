@@ -384,12 +384,15 @@ def ensure_default_worktree(state: AppState, config: ResolvedConfig) -> bool:
     from super_worker.constants import DEFAULT_WORKTREE_NAME
     from super_worker.models import Worktree
 
+    # Non-git projects have no branch — never call the git helper (avoids a
+    # needless subprocess and a "(unknown)" branch label on the folder).
+    branch = get_current_branch(str(config.repo_root)) if config.is_git else ""
+
     existing = state.get_worktree(DEFAULT_WORKTREE_NAME)
     if existing:
-        existing.branch = get_current_branch(str(config.repo_root))
+        existing.branch = branch
         return False
 
-    branch = get_current_branch(str(config.repo_root))
     wt = Worktree(name=DEFAULT_WORKTREE_NAME, path=str(config.repo_root), branch=branch)
     state.worktrees.insert(0, wt)
     return True
@@ -509,8 +512,9 @@ def reconcile_state(state: AppState, config: ResolvedConfig | None = None) -> bo
     # Ensure remain-on-exit is set on all existing sessions
     _ensure_remain_on_exit(state)
 
-    # Discover worktrees on disk that aren't in state
-    if config is not None:
+    # Discover worktrees on disk that aren't in state (git only — a non-git
+    # project has exactly one implicit "main" worktree, the folder itself).
+    if config is not None and config.is_git:
         known_paths = {wt.path for wt in state.worktrees}
         for wt in discover_worktrees(config):
             if wt.path not in known_paths:
@@ -550,7 +554,10 @@ def _normalize_registry(projects: list[str]) -> list[str]:
             try:
                 p = str(detect_repo_root(path))
             except RuntimeError:
-                continue  # exists but is no longer a git repo — drop
+                # A non-git folder is a first-class project now — keep it as-is
+                # (resolved, to match the repo_root load_config produces) rather
+                # than dropping it from the registry.
+                p = str(path.resolve())
         if p not in seen:
             seen.append(p)
     return seen
