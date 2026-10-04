@@ -1,0 +1,92 @@
+"""Preview key forwarding + text selection (regressions from the overhaul).
+
+The preview must stay interactive WITHOUT attaching: select text to copy,
+pass control/meta keys through to the session, and insert newlines.
+"""
+
+import pytest
+from textual.app import App, ComposeResult
+from textual.events import Key
+from textual.widgets import Static
+
+from super_worker.widgets.terminal_pane import TerminalPane
+
+
+class _Host(App):
+    def compose(self) -> ComposeResult:
+        yield TerminalPane()
+
+
+def _record(pane) -> list:
+    """Capture _send_keys_async calls instead of touching tmux."""
+    calls: list = []
+    pane._send_keys_async = lambda *a, **k: calls.append((a, k))
+    return calls
+
+
+async def _pane_with_session(app):
+    p = app.query_one(TerminalPane)
+    p.set_reactive(TerminalPane.active_session, "s")  # no watcher side effects
+    return p
+
+
+@pytest.mark.asyncio
+async def test_preview_content_is_selectable():
+    """Select-to-copy without attaching: content must allow text selection."""
+    app = _Host()
+    async with app.run_test():
+        assert app.query_one("#terminal-content", Static).ALLOW_SELECT is True
+
+
+@pytest.mark.asyncio
+async def test_ctrl_key_forwarded_as_named_key():
+    """Ctrl+B → tmux named key C-b (not the raw \\x02 byte, which arrives mangled)."""
+    app = _Host()
+    async with app.run_test():
+        p = await _pane_with_session(app)
+        calls = _record(p)
+        p.on_key(Key("ctrl+b", "\x02"))
+        assert (("C-b",), {}) in calls, calls
+
+
+@pytest.mark.asyncio
+async def test_alt_key_forwarded_as_meta():
+    app = _Host()
+    async with app.run_test():
+        p = await _pane_with_session(app)
+        calls = _record(p)
+        p.on_key(Key("alt+b", None))
+        assert (("M-b",), {}) in calls, calls
+
+
+@pytest.mark.asyncio
+async def test_printable_char_sent_literally():
+    app = _Host()
+    async with app.run_test():
+        p = await _pane_with_session(app)
+        calls = _record(p)
+        p.on_key(Key("slash", "/"))
+        assert (("/",), {"literal": True}) in calls, calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["shift+enter", "alt+enter", "ctrl+enter"])
+async def test_newline_keys_insert_newline(key):
+    """Newline shortcuts forward as meta+enter (ESC, Enter), not submit."""
+    app = _Host()
+    async with app.run_test():
+        p = await _pane_with_session(app)
+        calls = _record(p)
+        p.on_key(Key(key, None))
+        assert (("Escape", "Enter"), {}) in calls, calls
+
+
+@pytest.mark.asyncio
+async def test_plain_enter_submits():
+    """Plain Enter still submits (maps to Enter), distinct from a newline."""
+    app = _Host()
+    async with app.run_test():
+        p = await _pane_with_session(app)
+        calls = _record(p)
+        p.on_key(Key("enter", "\r"))
+        assert (("Enter",), {}) in calls, calls
