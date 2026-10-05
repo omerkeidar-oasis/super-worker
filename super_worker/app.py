@@ -78,6 +78,10 @@ class SuperWorkerApp(App):
     def __init__(self) -> None:
         super().__init__()
         install_hooks()
+        # Enable tmux extended-keys up front so Shift+Enter (Claude Code's
+        # newline) survives a later attach, even for sessions we only adopt.
+        from super_worker.services.tmux import configure_server_keyboard
+        configure_server_keyboard()
         self._active_project_view: ProjectView | None = None
         self._open_configs: list[ResolvedConfig] = []
         self._opening: set[str] = set()  # paths with an in-flight open worker
