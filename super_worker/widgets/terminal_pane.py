@@ -417,6 +417,13 @@ class TerminalPane(Widget, can_focus=True):
         except Exception:
             return True
 
+    def _has_active_selection(self) -> bool:
+        """True while the user has text selected on the current screen."""
+        try:
+            return bool(self.screen.selections)
+        except Exception:
+            return False
+
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
         if event.state != WorkerState.SUCCESS or event.worker.result is None:
             return
@@ -424,6 +431,13 @@ class TerminalPane(Widget, can_focus=True):
         if session_name != self.active_session:
             return  # Stale capture from before a session switch
         self._mouse_app = mouse_any
+        # A text selection is anchored to the current content; re-rendering
+        # mid-drag clears it before Textual's mouse-up auto-copy can read it.
+        # Freeze the view while something is selected (same idea as the
+        # scrolled-up freeze below); it resumes when the selection is cleared.
+        if self._has_active_selection():
+            self._last_key = _NO_KEY
+            return
         # Scrolled up = reading history: freeze the view — don't mutate
         # content and don't consume history (alignment is content-based, so
         # it drains cleanly after unfreezing). Polling continues; the first

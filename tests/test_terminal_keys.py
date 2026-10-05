@@ -90,3 +90,39 @@ async def test_plain_enter_submits():
         calls = _record(p)
         p.on_key(Key("enter", "\r"))
         assert (("Enter",), {}) in calls, calls
+
+
+@pytest.mark.asyncio
+async def test_render_frozen_while_selecting(monkeypatch):
+    """Live re-render must pause while text is selected, so the mouse-up
+    auto-copy reads a stable selection instead of a cleared one."""
+    from textual.worker import WorkerState
+    from rich.text import Text as _Text
+
+    app = _Host()
+    async with app.run_test():
+        p = await _pane_with_session(app)
+        p._at_bottom = lambda: True
+        content = app.query_one("#terminal-content", Static)
+        updates: list = []
+        content.update = lambda t=None, **k: updates.append(getattr(t, "plain", t))
+
+        result = ("s", object(), _Text("LIVE"), None, None, 0, False, False)
+
+        class _Evt:
+            state = WorkerState.SUCCESS
+
+            class worker:  # noqa: N801
+                pass
+
+        _Evt.worker.result = result
+
+        # Selection active → content must NOT be mutated.
+        monkeypatch.setattr(p, "_has_active_selection", lambda: True)
+        p.on_worker_state_changed(_Evt())
+        assert updates == [], "re-rendered despite an active selection"
+
+        # No selection → content updates normally.
+        monkeypatch.setattr(p, "_has_active_selection", lambda: False)
+        p.on_worker_state_changed(_Evt())
+        assert "LIVE" in updates, updates
