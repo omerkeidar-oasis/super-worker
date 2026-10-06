@@ -305,6 +305,20 @@ class SuperWorkerApp(App):
             self._attention_paths.discard(event.path)
         self._refresh_drawer()
 
+    def on_text_selected(self, event) -> None:
+        """Auto-copy a mouse selection to the clipboard (select-to-copy).
+
+        Textual copies a selection only on Ctrl+C by default; the preview
+        forwards keys to the session, so restore the expected behavior: copy
+        as soon as a selection is made.
+        """
+        try:
+            text = self.screen.get_selected_text()
+        except Exception:
+            text = None
+        if text:
+            self.copy_to_clipboard(text)
+
     def on_project_selected(self, event: ProjectSelected) -> None:
         async def _open():
             await self._open_or_switch_project(event.path)

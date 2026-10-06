@@ -126,3 +126,14 @@ async def test_render_frozen_while_selecting(monkeypatch):
         monkeypatch.setattr(p, "_has_active_selection", lambda: False)
         p.on_worker_state_changed(_Evt())
         assert "LIVE" in updates, updates
+
+
+@pytest.mark.asyncio
+async def test_ctrl_c_interrupts_session():
+    """Ctrl+C forwards an interrupt (C-c); copy is auto-on-select, not Ctrl+C."""
+    app = _Host()
+    async with app.run_test():
+        p = await _pane_with_session(app)
+        calls = _record(p)
+        p.on_key(Key("ctrl+c", "\x03"))
+        assert (("C-c",), {}) in calls, calls
