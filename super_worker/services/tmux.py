@@ -32,23 +32,6 @@ def _get_server() -> libtmux.Server:
     return _server
 
 
-def configure_server_keyboard() -> None:
-    """Enable tmux extended-keys so modified keys reach apps when attached.
-
-    Claude Code uses Shift+Enter (and other modified combos) to insert a
-    newline; with tmux's default ``extended-keys off`` the terminal can't
-    signal them through tmux, so Claude sees a plain Enter and submits instead.
-    This is a SERVER-WIDE option on the shared default socket — safe (apps opt
-    in; terminals without extended-key support just ignore it) and idempotent.
-    """
-    try:
-        server = _get_server()
-        server.cmd("set-option", "-s", "extended-keys", "on")
-        server.cmd("set-option", "-as", "terminal-features", "*:extkeys")
-    except Exception:
-        logger.debug("Failed to enable tmux extended-keys", exc_info=True)
-
-
 def _get_pane(session_name: str) -> libtmux.Pane | None:
     """Get cached pane reference, refreshing if stale."""
     now = time.monotonic()
@@ -409,7 +392,6 @@ def create_session(
     handed out in the same batch but not yet committed to state.
     """
     server = _get_server()
-    configure_server_keyboard()  # ensure Shift+Enter etc. survive a later attach
     sess_name = _find_available_session_name(worktree, reserved=reserved_names)
 
     if session_type == "terminal":

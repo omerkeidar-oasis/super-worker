@@ -28,21 +28,6 @@ def test_tmux_session_name(name, index, expected):
     assert tmux_session_name(name, index) == expected
 
 
-def test_configure_server_keyboard_enables_extended_keys(monkeypatch):
-    """sw enables tmux extended-keys + extkeys so Shift+Enter works when attached."""
-    import super_worker.services.tmux as tmux_mod
-
-    calls = []
-    server = MagicMock()
-    server.cmd = lambda *a, **k: calls.append(a)
-    monkeypatch.setattr(tmux_mod, "_get_server", lambda: server)
-
-    tmux_mod.configure_server_keyboard()
-
-    assert ("set-option", "-s", "extended-keys", "on") in calls
-    assert ("set-option", "-as", "terminal-features", "*:extkeys") in calls
-
-
 def test_default_session_label_uses_unique_index():
     """Default labels derive from the session's unique tmux index, not a count.
 
