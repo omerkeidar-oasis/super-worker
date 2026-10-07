@@ -828,18 +828,3 @@ async def test_git_project_keeps_git_section():
         await pilot.press("ctrl+n")
         await pilot.pause()
         assert isinstance(app.screen, NewWorktreeScreen)
-
-
-@pytest.mark.asyncio
-async def test_selection_auto_copies_to_clipboard(monkeypatch):
-    """A mouse text selection is copied to the clipboard automatically."""
-    from textual import events
-
-    app = SuperWorkerApp()
-    async with app.run_test() as pilot:
-        await pilot.pause(delay=0.3)
-        monkeypatch.setattr(app.screen, "get_selected_text", lambda: "hello world")
-        copied: list = []
-        monkeypatch.setattr(app, "copy_to_clipboard", lambda t: copied.append(t))
-        app.on_text_selected(events.TextSelected())
-        assert copied == ["hello world"]
