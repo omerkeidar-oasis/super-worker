@@ -34,6 +34,26 @@ from super_worker.widgets.sidebar import SidebarDivider
 logger = logging.getLogger(__name__)
 
 
+def _copy_to_clipboard_pbcopy(text: str) -> bool:
+    """Copy text directly to the macOS system clipboard via pbcopy.
+
+    Textual's own copy uses OSC 52, which some terminals (notably the VS Code /
+    Antigravity integrated terminals) don't honor — so a marked selection never
+    reached the clipboard. pbcopy writes the system clipboard directly, with no
+    terminal dependency. Returns True on success.
+    """
+    import shutil
+    import subprocess
+
+    if not shutil.which("pbcopy"):
+        return False
+    try:
+        subprocess.run(["pbcopy"], input=text.encode("utf-8"), timeout=2, check=True)
+        return True
+    except Exception:
+        return False
+
+
 class SuperWorkerApp(App):
     """Super Worker — Claude Code Instance Manager TUI."""
 
@@ -300,6 +320,22 @@ class SuperWorkerApp(App):
         else:
             self._attention_paths.discard(event.path)
         self._refresh_drawer()
+
+    def on_text_selected(self, event) -> None:
+        """Auto-copy a marked selection to the clipboard (select-to-copy).
+
+        The preview forwards keys to the session, so Textual's Ctrl+C copy is
+        unavailable there; copy as soon as a selection is made instead. Use both
+        OSC 52 (remote/term-native) and pbcopy (reliable on local macOS).
+        """
+        try:
+            text = self.screen.get_selected_text()
+        except Exception:
+            text = None
+        if not text:
+            return
+        self.copy_to_clipboard(text)
+        _copy_to_clipboard_pbcopy(text)
 
     def on_project_selected(self, event: ProjectSelected) -> None:
         async def _open():

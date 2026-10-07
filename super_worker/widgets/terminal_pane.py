@@ -238,7 +238,6 @@ class TerminalPane(Widget, can_focus=True):
         with scroll:
             content = Static("Select a session · Ctrl+A to attach", id="terminal-content")
             content.auto_links = False
-            content.ALLOW_SELECT = False
             yield content
 
     def watch_active_session(self, old_value: str | None, session_name: str | None) -> None:
@@ -418,6 +417,13 @@ class TerminalPane(Widget, can_focus=True):
         except Exception:
             return True
 
+    def _has_active_selection(self) -> bool:
+        """True while the user has text selected on the current screen."""
+        try:
+            return bool(self.screen.selections)
+        except Exception:
+            return False
+
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
         if event.state != WorkerState.SUCCESS or event.worker.result is None:
             return
@@ -425,6 +431,13 @@ class TerminalPane(Widget, can_focus=True):
         if session_name != self.active_session:
             return  # Stale capture from before a session switch
         self._mouse_app = mouse_any
+        # A text selection is anchored to the current content; re-rendering
+        # mid-drag clears it before Textual's mouse-up auto-copy can read it.
+        # Freeze the view while something is selected (same idea as the
+        # scrolled-up freeze below); it resumes when the selection is cleared.
+        if self._has_active_selection():
+            self._last_key = _NO_KEY
+            return
         # Scrolled up = reading history: freeze the view — don't mutate
         # content and don't consume history (alignment is content-based, so
         # it drains cleanly after unfreezing). Polling continues; the first
@@ -493,7 +506,6 @@ class TerminalPane(Widget, can_focus=True):
             state.chunks.append(new_text)
             state.counts.append(new_lines)
             widget = Static(new_text, classes="hist-chunk")
-            widget.ALLOW_SELECT = False
             state.widgets.append(widget)
             scroll.mount(widget, before=content)
         state.total += new_lines
@@ -529,7 +541,6 @@ class TerminalPane(Widget, can_focus=True):
             return
         for chunk in state.chunks:
             widget = Static(chunk, classes="hist-chunk")
-            widget.ALLOW_SELECT = False
             state.widgets.append(widget)
             scroll.mount(widget, before=content)
 
@@ -594,10 +605,13 @@ class TerminalPane(Widget, can_focus=True):
         "shift+tab": "BTab",
     }
 
-    # Key combos that insert a newline in Claude Code's input.
+    # Key combos that insert a newline in Claude Code's input. Which of these a
+    # terminal actually delivers varies; we accept all the common ones so at
+    # least one of a user's muscle-memory shortcuts works.
     _NEWLINE_KEYS = {
         "shift+enter", "shift+return",
         "alt+enter", "alt+return",
+        "ctrl+enter", "ctrl+return",
     }
 
     def on_unmount(self) -> None:
@@ -678,10 +692,14 @@ class TerminalPane(Widget, can_focus=True):
             event.stop()
 
     def on_click(self, event: Click) -> None:
-        """Focus the pane; forward the click when the pane's app is mouse-aware."""
-        event.stop()
+        """Focus the pane; forward the click when the pane's app is mouse-aware.
+
+        When the app ISN'T mouse-aware, let the click bubble so Textual's text
+        selection keeps working — selecting to copy without attaching (Ctrl+A).
+        """
         self.focus()
         if self._mouse_app and self.active_session:
+            event.stop()
             col, row = self._pane_cell(event)
             # SGR press + release, left button
             self._send_keys_async(
@@ -729,10 +747,16 @@ class TerminalPane(Widget, can_focus=True):
             self._send_keys_async("Escape", "Enter")
         elif key in self._SPECIAL_KEY_MAP:
             self._send_keys_async(self._SPECIAL_KEY_MAP[key])
+        elif key.startswith("ctrl+") and "+" not in key[5:]:
+            # Ctrl combos as tmux NAMED keys (C-b, C-r, …). MUST come before the
+            # literal-character branch: Textual also sets event.character to the
+            # raw control byte (Ctrl+B → \x02), and sending that literally
+            # arrives mangled — "C-<x>" is the form tmux delivers reliably.
+            self._send_keys_async(f"C-{key[5:]}")
+        elif key.startswith("alt+") and "+" not in key[4:]:
+            # Meta combos (tmux M-<x> = ESC prefix then the key).
+            self._send_keys_async(f"M-{key[4:]}")
         elif event.character and len(event.character) == 1:
             # Send printable characters as literal text so that '/', ';',
             # and other tmux-special characters arrive unmangled.
             self._send_keys_async(event.character, literal=True)
-        elif key.startswith("ctrl+"):
-            letter = key.split("+", 1)[1]
-            self._send_keys_async(f"C-{letter}")

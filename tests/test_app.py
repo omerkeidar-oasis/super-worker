@@ -828,3 +828,22 @@ async def test_git_project_keeps_git_section():
         await pilot.press("ctrl+n")
         await pilot.pause()
         assert isinstance(app.screen, NewWorktreeScreen)
+
+
+@pytest.mark.asyncio
+async def test_selection_auto_copies_via_osc52_and_pbcopy(monkeypatch):
+    """A marked selection is copied through BOTH OSC 52 and pbcopy (reliable)."""
+    from textual import events
+    import super_worker.app as app_mod
+
+    app = SuperWorkerApp()
+    async with app.run_test() as pilot:
+        await pilot.pause(delay=0.3)
+        monkeypatch.setattr(app.screen, "get_selected_text", lambda: "clip me 99")
+        osc: list = []
+        pb: list = []
+        monkeypatch.setattr(app, "copy_to_clipboard", lambda t: osc.append(t))
+        monkeypatch.setattr(app_mod, "_copy_to_clipboard_pbcopy", lambda t: pb.append(t) or True)
+        app.on_text_selected(events.TextSelected())
+        assert osc == ["clip me 99"]
+        assert pb == ["clip me 99"]
